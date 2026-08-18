@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MODEL="gemini-2.5-pro"
+OUTPUT=""
+THINKING=1
+
+usage() {
+    cat <<'EOF'
+usage: gemini-ask [--model MODEL] [--no-thinking] [--output FILE] PROMPT.md
+
+Send one prompt file to Gemini through the google-genai SDK. Requires
+GEMINI_API_KEY in the environment, usually via with-secrets secrets/gemini.env.
+EOF
+}
+
+while (($#)); do
+    case "$1" in
+        --model) MODEL="${2:-}"; shift 2 ;;
+        --output) OUTPUT="${2:-}"; shift 2 ;;
+        --no-thinking) THINKING=0; shift ;;
+        -h|--help) usage; exit 0 ;;
+        --) shift; break ;;
+        -*) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
+        *) break ;;
+    esac
+done
+
+PROMPT="${1:-}"
+[[ -n "$PROMPT" && -f "$PROMPT" ]] || { usage >&2; exit 2; }
+[[ -n "${GEMINI_API_KEY:-}" ]] || { echo "GEMINI_API_KEY is not set" >&2; exit 1; }
+if [[ -z "$OUTPUT" ]]; then
+    OUTPUT="${PROMPT%.*}.gemini.resp.md"
+fi
+
+uv run --with google-genai python3 - "$MODEL" "$THINKING" "$PROMPT" "$OUTPUT" <<'PY'
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+from google import genai
+from google.genai import types
+
+model = sys.argv[1]
+thinking = sys.argv[2] == "1"
+prompt = Path(sys.argv[3]).read_text()
+output = Path(sys.argv[4])
+
+config = None
+if not thinking:
+    config = types.GenerateContentConfig(
+        thinking_config=types.ThinkingConfig(thinking_budget=0)
+    )
+
+client = genai.Client()
+response = client.models.generate_content(
+    model=model,
+    contents=prompt,
+    config=config,
+)
+text = response.text or ""
+output.write_text(text)
+print(output)
+PY

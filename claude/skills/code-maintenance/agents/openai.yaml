@@ -1,0 +1,4 @@
+interface:
+  display_name: "Code Maintenance"
+  short_description: "Consolidate, type, and debug existing code"
+  default_prompt: "Use $code-maintenance to simplify this codebase, remove redundant mechanisms, improve typing, and fix defects without weakening its contracts."

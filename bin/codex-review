@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+if [[ "${1:-}" == --version ]]; then
+    echo "codex-review 1.0"
+    exit 0
+fi
+export AGENT_REVIEW_DEFAULT_REVIEWER=codex
+export AGENT_REVIEW_PROG=codex-review
+exec "${SCRIPT_DIR}/agent-review" "$@"

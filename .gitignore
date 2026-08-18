@@ -1,0 +1,25 @@
+.DS_Store
+.setup-tmp/
+
+# Runtime state belongs outside the repo. These are here as belt-and-suspenders
+# in case a tool directory is copied into the checkout by mistake.
+.claude/
+.codex/
+**/projects/
+**/history.jsonl
+**/session*.jsonl
+
+# Codex owns and rewrites its live config. The repo carries only the stable
+# seed copied by ./links on first setup.
+codex/config.toml
+
+# Breadcrumb digests and /handoff output are local session traces, written by
+# bin/claude-breadcrumbs.py and the handoff command under ~/dotfiles/claude/.
+claude/breadcrumbs/
+claude/handoffs/
+
+# Never commit age private keys. Encrypted dotenv files are intentionally NOT
+# ignored; self-check rejects plaintext .env files and allows SOPS-encrypted
+# ones.
+secrets/age/
+**/keys.txt

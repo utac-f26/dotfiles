@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+CODEX_SEED="${REPO_ROOT}/codex/config.seed.toml"
+
+usage() {
+    cat <<'EOF'
+usage: ./links [--check]
+
+Without arguments, install the repository-owned links and seed Codex's live
+config when absent. --check validates the same declaration without changing
+anything.
+EOF
+}
+
+log() {
+    printf 'links: %s\n' "$*" >&2
+}
+
+backup_path() {
+    local dst="$1"
+    local backup="${dst}.pre-utac.bak"
+    local n=1
+    while [[ -e "$backup" || -L "$backup" ]]; do
+        n=$((n + 1))
+        backup="${dst}.pre-utac.bak.${n}"
+    done
+    mv "$dst" "$backup"
+    log "moved existing $dst to $backup"
+}
+
+link_one() {
+    local src="$1"
+    local dst="$2"
+    mkdir -p "$(dirname "$dst")"
+    if [[ -L "$dst" ]]; then
+        local target
+        target="$(readlink "$dst")"
+        if [[ "$target" == "$src" ]]; then
+            return
+        fi
+        backup_path "$dst"
+    elif [[ -e "$dst" ]]; then
+        backup_path "$dst"
+    fi
+    ln -s "$src" "$dst"
+    log "linked $dst -> $src"
+}
+
+seed_codex_config() {
+    local dst="${HOME}/.codex/config.toml"
+    local tmp
+    mkdir -p "$(dirname "$dst")"
+
+    if [[ -L "$dst" ]]; then
+        if [[ -e "$dst" ]]; then
+            tmp="${dst}.utac-seed.$$"
+            cp -L "$dst" "$tmp"
+            rm "$dst"
+            mv "$tmp" "$dst"
+            log "converted $dst to an app-owned file"
+        else
+            rm "$dst"
+            log "removed stale $dst symlink"
+        fi
+    fi
+    if [[ ! -e "$dst" ]]; then
+        cp "$CODEX_SEED" "$dst"
+        log "seeded $dst from codex/config.seed.toml"
+    fi
+}
+
+check_one() {
+    local src="$1"
+    local dst="$2"
+    if [[ ! -L "$dst" || "$(readlink "$dst")" != "$src" ]]; then
+        log "check failed: $dst does not link to $src"
+        return 1
+    fi
+}
+
+check_codex_config() {
+    local dst="${HOME}/.codex/config.toml"
+    if [[ ! -f "$dst" || -L "$dst" ]]; then
+        log "check failed: $dst must be a regular app-owned file"
+        return 1
+    fi
+}
+
+main() {
+    local spec src dst
+    local mode="apply"
+    if (($#)); then
+        case "$1" in
+            --check) mode="check" ;;
+            -h|--help) usage; return 0 ;;
+            *) log "error: unknown argument: $1"; usage >&2; return 2 ;;
+        esac
+        shift
+    fi
+    (($# == 0)) || { log "error: extra argument: $1"; return 2; }
+
+    local specs=(
+        "${REPO_ROOT}/.tmux.conf|${HOME}/.tmux.conf"
+        "${REPO_ROOT}/AGENTS.md|${HOME}/.claude/AGENTS.md"
+        "${REPO_ROOT}/claude/CLAUDE.md|${HOME}/.claude/CLAUDE.md"
+        "${REPO_ROOT}/claude/settings.json|${HOME}/.claude/settings.json"
+        "${REPO_ROOT}/claude/commands|${HOME}/.claude/commands"
+        "${REPO_ROOT}/claude/skills|${HOME}/.claude/skills"
+        "${REPO_ROOT}/AGENTS.md|${HOME}/.codex/AGENTS.md"
+        # Agent Skills uses ~/.agents/skills as the client-neutral scope, so
+        # Codex sees this skill too. codex-review stays Claude-only: it
+        # launches a separate Codex reviewer and must not review itself.
+        "${REPO_ROOT}/claude/skills/code-maintenance|${HOME}/.agents/skills/code-maintenance"
+        # The symmetric review skill is Codex-only: it launches Claude and
+        # must not become a Claude self-review recipe.
+        "${REPO_ROOT}/codex/skills/claude-review|${HOME}/.agents/skills/claude-review"
+    )
+
+    for src in "${REPO_ROOT}"/bin/*; do
+        [[ -f "$src" ]] || continue
+        specs+=("${src}|${HOME}/bin/$(basename "$src")")
+    done
+
+    # Refuse a partial setup caused by a stale declaration or missing seed.
+    for spec in "${specs[@]}" "${CODEX_SEED}|"; do
+        src="${spec%%|*}"
+        [[ -e "$src" ]] || {
+            log "error: missing managed source: $src"
+            return 1
+        }
+    done
+
+    if [[ "$mode" == check ]]; then
+        local failures=0
+        for spec in "${specs[@]}"; do
+            src="${spec%%|*}"
+            dst="${spec#*|}"
+            check_one "$src" "$dst" || failures=$((failures + 1))
+        done
+        check_codex_config || failures=$((failures + 1))
+        if ((failures)); then
+            log "$failures managed path(s) failed validation"
+            return 1
+        fi
+        log "check OK: all managed links and Codex config are current"
+        return 0
+    fi
+
+    for spec in "${specs[@]}"; do
+        src="${spec%%|*}"
+        dst="${spec#*|}"
+        link_one "$src" "$dst"
+    done
+    seed_codex_config
+}
+
+main "$@"

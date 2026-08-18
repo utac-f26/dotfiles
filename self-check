@@ -1,0 +1,317 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+RECEIPT="${REPO_ROOT}/.setup-receipt.json"
+VERSION=5
+REQUIRED_TOOLS="${REPO_ROOT}/required-tools.txt"
+UPSTREAM_URL="$(tr -d '[:space:]' <"${REPO_ROOT}/upstream-url")"
+TMP_DIR="$(mktemp -d)"
+CHECKS_TSV="${TMP_DIR}/checks.tsv"
+TOOLS_TSV="${TMP_DIR}/tools.tsv"
+FAILURES=0
+
+cleanup() {
+    rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT
+
+sanitize() {
+    printf '%s' "$1" | tr '\t\n' '  '
+}
+
+add_check() {
+    local name="$1"
+    local passed="$2"
+    local detail
+    detail="$(sanitize "$3")"
+    printf '%s\t%s\t%s\n' "$name" "$passed" "$detail" >>"$CHECKS_TSV"
+    if [[ "$passed" != "true" ]]; then
+        FAILURES=$((FAILURES + 1))
+        printf 'FAIL %-24s %s\n' "$name" "$detail" >&2
+    else
+        printf 'OK   %-24s %s\n' "$name" "$detail" >&2
+    fi
+}
+
+normalize_path() {
+    local path="$1"
+    case "$path" in
+        "$HOME"/*) printf '%s/%s' "~" "${path#"$HOME"/}" ;;
+        "$REPO_ROOT"/*) printf 'repo:%s' "${path#"$REPO_ROOT"/}" ;;
+        /*) printf 'system:%s' "$path" ;;
+        *) printf '%s' "$path" ;;
+    esac
+}
+
+python311() {
+    if [[ -n "${DOTFILES_PYTHON:-}" ]]; then
+        "${DOTFILES_PYTHON}" "$@"
+    else
+        uv run --no-project --python 3.11 python "$@"
+    fi
+}
+
+version_for() {
+    local tool="$1"
+    case "$tool" in
+        ssh) ssh -V 2>&1 | head -n 1 ;;
+        *) "$tool" --version 2>&1 | head -n 1 ;;
+    esac
+}
+
+add_tool() {
+    local tool="$1"
+    local path version
+    path="$(command -v "$tool" 2>/dev/null || true)"
+    if [[ -z "$path" || ! -x "$path" ]]; then
+        printf '%s\t%s\t%s\n' "$tool" "missing" "" >>"$TOOLS_TSV"
+        return 1
+    fi
+    if ! version="$(version_for "$tool")"; then
+        printf '%s\t%s\t%s\n' \
+            "$tool" "$(normalize_path "$path")" "" >>"$TOOLS_TSV"
+        return 1
+    fi
+    version="$(sanitize "$version")"
+    if [[ -z "$version" ]]; then
+        printf '%s\t%s\t%s\n' \
+            "$tool" "$(normalize_path "$path")" "" >>"$TOOLS_TSV"
+        return 1
+    fi
+    printf '%s\t%s\t%s\n' \
+        "$tool" "$(normalize_path "$path")" "$version" >>"$TOOLS_TSV"
+}
+
+check_managed_links() {
+    local detail
+    if detail="$("${REPO_ROOT}/links" --check 2>&1)"; then
+        add_check "managed_links" true \
+            "all declared links and the app-owned Codex config are current"
+    else
+        add_check "managed_links" false "$detail"
+    fi
+}
+
+check_core_tools() {
+    local unavailable=()
+    local since tool extra
+    : >"$TOOLS_TSV"
+    while read -r since tool extra; do
+        [[ -n "$since" && "$since" != \#* ]] || continue
+        if [[ ! "$since" =~ ^[1-9][0-9]*$ || -z "$tool" || -n "$extra" ]]; then
+            add_check "core_tools" false \
+                "required-tools.txt has an invalid contract line"
+            return
+        fi
+        ((since <= VERSION)) || continue
+        if ! add_tool "$tool"; then
+            unavailable+=("$tool")
+        fi
+    done <"$REQUIRED_TOOLS"
+    if ((${#unavailable[@]} == 0)); then
+        add_check "core_tools" true \
+            "required commands resolve on PATH and report versions"
+    else
+        add_check "core_tools" false \
+            "missing or unusable: ${unavailable[*]}"
+    fi
+}
+
+check_kit_revision() {
+    local stamp="${REPO_ROOT}/KIT_REV"
+    if [[ -f "$stamp" ]] \
+        && grep -Eq '^[1-9][0-9]*\.[0-9a-f]{12}$' "$stamp"
+    then
+        add_check "kit_revision" true "$(tr -d '[:space:]' <"$stamp")"
+    else
+        add_check "kit_revision" false "KIT_REV is missing or malformed"
+    fi
+}
+
+check_update_remote() {
+    local upstream pull_remote pull_ref push_remote rebase
+    upstream="$(git -C "$REPO_ROOT" remote get-url upstream 2>/dev/null || true)"
+    pull_remote="$(git -C "$REPO_ROOT" config --get branch.main.remote || true)"
+    pull_ref="$(git -C "$REPO_ROOT" config --get branch.main.merge || true)"
+    push_remote="$(git -C "$REPO_ROOT" config --get remote.pushDefault || true)"
+    rebase="$(git -C "$REPO_ROOT" config --get pull.rebase || true)"
+    if [[ "$upstream" == "$UPSTREAM_URL" \
+        && "$pull_remote" == upstream \
+        && "$pull_ref" == refs/heads/main \
+        && "$push_remote" == origin \
+        && "$rebase" == false ]]
+    then
+        add_check "update_remote" true \
+            "git pull reads the course template; git push writes personal origin"
+    else
+        add_check "update_remote" false "rerun ./setup to configure Git updates"
+    fi
+}
+
+check_github_auth() {
+    if gh auth status --hostname github.com >/dev/null 2>&1; then
+        add_check "github_auth" true "GitHub CLI authenticated to github.com"
+    else
+        add_check "github_auth" false "run gh auth login for github.com"
+    fi
+}
+
+check_codex_auth() {
+    if codex login status >/dev/null 2>&1; then
+        add_check "codex_auth" true \
+            "Codex CLI signed in with a ChatGPT account"
+    else
+        add_check "codex_auth" false \
+            "run codex login with your UT ChatGPT account"
+    fi
+}
+
+check_age_key() {
+    local key_file="${HOME}/.config/sops/age/keys.txt"
+    local marker="AGE-SECRET-""KEY-"
+    if [[ -s "$key_file" ]] && grep -q "$marker" "$key_file"; then
+        add_check "age_key" true "age key exists outside the repo"
+    else
+        add_check "age_key" false "missing age key at ~/.config/sops/age/keys.txt"
+    fi
+}
+
+check_secrets_roundtrip() {
+    local plain enc key_file recipient
+    plain="${TMP_DIR}/example.env"
+    enc="${TMP_DIR}/example.sops.env"
+    key_file="${HOME}/.config/sops/age/keys.txt"
+    printf 'EXAMPLE_SECRET=hello\n' >"$plain"
+    recipient="$(age-keygen -y "$key_file" | tail -n 1 2>/dev/null || true)"
+    if [[ -z "$recipient" ]]; then
+        add_check "secrets_roundtrip" false "could not derive age recipient"
+        return
+    fi
+    # shellcheck disable=SC2016
+    if sops --encrypt --age "$recipient" --input-type dotenv --output-type dotenv "$plain" >"$enc" \
+        && with-secrets "$enc" -- \
+            sh -c 'test "${EXAMPLE_SECRET:-}" = hello'; then
+        add_check "secrets_roundtrip" true "SOPS dotenv consumed through with-secrets"
+    else
+        add_check "secrets_roundtrip" false "SOPS/with-secrets dummy secret failed"
+    fi
+}
+
+is_env_like() {
+    local path="$1"
+    local base="${path##*/}"
+    case "$base" in
+        *.env.example) return 1 ;;
+        .env|*.env|*.env.*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+check_plaintext_leaks() {
+    local problems=()
+    local path marker
+    marker="AGE-SECRET-""KEY-"
+    if ! git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        add_check "plaintext_leak_guard" false "repo is not a git checkout"
+        return
+    fi
+    while IFS= read -r path; do
+        [[ -f "${REPO_ROOT}/${path}" ]] || continue
+        if grep -q "$marker" "${REPO_ROOT}/${path}"; then
+            problems+=("${path}: age private key")
+            continue
+        fi
+        if is_env_like "$path"; then
+            if ! grep -Eq '(^sops:|^sops_)' "${REPO_ROOT}/${path}"; then
+                problems+=("${path}: env-like file without SOPS metadata")
+            fi
+        fi
+    done < <(git -C "$REPO_ROOT" ls-files --cached --others --exclude-standard)
+    if ((${#problems[@]} == 0)); then
+        add_check "plaintext_leak_guard" true "no plaintext env files or age keys tracked"
+    else
+        add_check "plaintext_leak_guard" false "${problems[*]}"
+    fi
+}
+
+write_receipt() {
+    local kit_rev
+    kit_rev="$(tr -d '[:space:]' <"${REPO_ROOT}/KIT_REV")"
+    python311 - "$VERSION" "$CHECKS_TSV" "$TOOLS_TSV" "$RECEIPT" \
+        "$kit_rev" <<'PY'
+from __future__ import annotations
+
+import json
+import platform
+import sys
+from datetime import UTC, datetime
+from pathlib import Path
+
+version = int(sys.argv[1])
+checks_tsv = Path(sys.argv[2])
+tools_tsv = Path(sys.argv[3])
+receipt = Path(sys.argv[4])
+kit_rev = sys.argv[5]
+
+checks = []
+for line in checks_tsv.read_text().splitlines():
+    name, passed, detail = line.split("\t", 2)
+    checks.append({"name": name, "passed": passed == "true", "detail": detail})
+
+tools = {}
+for line in tools_tsv.read_text().splitlines():
+    name, path, version_text = line.split("\t", 2)
+    tools[name] = {"path": path, "version": version_text}
+
+payload = {
+    "receipt_version": version,
+    "kit_rev": kit_rev,
+    "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
+    "platform": {"os": platform.system(), "arch": platform.machine()},
+    "checks": checks,
+    "tools": tools,
+}
+receipt.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+PY
+}
+
+check_homework_complete() {
+    # Reports the out-of-class HW0 items so students can tell when they are
+    # actually done. Exit 0 only when nothing remains.
+    python311 "${REPO_ROOT}/bin/hw0-check.py" --repo "$REPO_ROOT" \
+        --codex-version "$(codex --version 2>/dev/null | head -n 1 || true)"
+}
+
+main() {
+    cd "$REPO_ROOT"
+    : >"$CHECKS_TSV"
+    check_managed_links
+    check_kit_revision
+    check_update_remote
+    check_core_tools
+    check_github_auth
+    check_codex_auth
+    check_age_key
+    check_secrets_roundtrip
+    check_plaintext_leaks
+
+    if ((FAILURES == 0)); then
+        write_receipt
+        printf 'wrote %s\n' "$RECEIPT" >&2
+        if check_homework_complete; then
+            printf 'HW0 complete: receipt, SUBMISSION.md, and agent section all present\n' >&2
+        else
+            printf 'setup receipt OK; HW0 items remain (TODO lines above)\n' >&2
+            return 2
+        fi
+    else
+        rm -f "$RECEIPT"
+        printf 'self-check failed; receipt not written\n' >&2
+        return 1
+    fi
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

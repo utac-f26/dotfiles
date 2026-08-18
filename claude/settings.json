@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "SessionEnd": [
+      {
+        "matcher": "clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/dotfiles/bin/claude-breadcrumbs.py\" sessionend",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/dotfiles/bin/claude-breadcrumbs.py\" sessionstart",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

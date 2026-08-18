@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+usage: codex-session NAME PROMPT.md
+
+Convenience wrapper for:
+  codex-ask --session NAME PROMPT.md
+EOF
+}
+
+if (($# != 2)); then
+    usage >&2
+    exit 2
+fi
+
+exec codex-ask --session "$1" "$2"

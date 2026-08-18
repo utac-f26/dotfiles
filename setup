@@ -1,0 +1,383 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+LOCAL_BIN="${HOME}/.local/bin"
+UPSTREAM_URL="$(tr -d '[:space:]' <"${REPO_ROOT}/upstream-url")"
+NODE_VERSION="${NODE_VERSION:-v22.17.1}"
+UPDATE=0
+SKIP_INSTALL="${DOTFILES_SKIP_INSTALL:-0}"
+MIN_FREE_MB="${DOTFILES_MIN_FREE_MB:-2000}"
+
+# Pinned release versions. releases/download/<tag>/<asset> URLs need no
+# GitHub API call, so a whole lab section can run ./setup the same evening
+# behind campus NAT without tripping the unauthenticated API rate limit
+# (60 requests/hour per IP). Pins also keep the cohort on identical
+# binaries. fd stays at 10.3.0: later releases dropped the
+# x86_64-apple-darwin asset that Intel-Mac students need.
+GH_VERSION=2.97.0
+RG_VERSION=15.2.0
+FD_VERSION=10.3.0
+FZF_VERSION=0.74.2
+AGE_VERSION=1.3.1
+SOPS_VERSION=3.13.3
+JQ_VERSION=1.8.2
+
+usage() {
+    cat <<'EOF'
+usage: ./setup [--update]
+
+Installs the course toolchain without root, creates the SOPS age key if needed,
+and links the student-owned Claude/Codex config files. Tool versions are
+pinned at the top of this script; --update reinstalls the pinned versions
+(bump the pins first to move forward).
+EOF
+}
+
+while (($#)); do
+    case "$1" in
+        --update) UPDATE=1 ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
+    esac
+    shift
+done
+
+log() {
+    printf 'setup: %s\n' "$*" >&2
+}
+
+die() {
+    printf 'setup: error: %s\n' "$*" >&2
+    exit 1
+}
+
+have() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+should_install() {
+    local tool="$1"
+    [[ "$UPDATE" == 1 ]] || ! have "$tool"
+}
+
+append_path_once() {
+    local rc="$1"
+    local marker="# >>> UTAC dotfiles PATH >>>"
+    local end_marker="# <<< UTAC dotfiles PATH <<<"
+    mkdir -p "$(dirname "$rc")"
+    touch "$rc"
+    if grep -Fq "$marker" "$rc"; then
+        return
+    fi
+    cat >>"$rc" <<EOF
+
+${marker}
+export PATH="\$HOME/.local/bin:\$HOME/bin:\$PATH"
+${end_marker}
+EOF
+    log "added PATH block to $rc"
+}
+
+ensure_path() {
+    mkdir -p "$LOCAL_BIN" "${HOME}/bin"
+    export PATH="${LOCAL_BIN}:${HOME}/bin:${PATH}"
+    append_path_once "${HOME}/.bashrc"
+    # A bash login shell (every SSH session to a department host) reads
+    # .bash_profile or .profile, not .bashrc. If the profile doesn't chain
+    # to .bashrc, the PATH block above never loads in exactly the remote
+    # sessions the course encourages — so put it in the file bash actually
+    # reads. Prefer whichever profile already exists; bash consults
+    # .bash_profile first, so create that one when neither exists.
+    if [[ -f "${HOME}/.bash_profile" ]]; then
+        append_path_once "${HOME}/.bash_profile"
+    elif [[ -f "${HOME}/.profile" ]]; then
+        append_path_once "${HOME}/.profile"
+    else
+        append_path_once "${HOME}/.bash_profile"
+    fi
+    if [[ "${SHELL##*/}" == zsh || -f "${HOME}/.zshrc" ]]; then
+        append_path_once "${HOME}/.zshrc"
+    fi
+}
+
+configure_git_updates() {
+    local branch existing
+    branch="$(git -C "$REPO_ROOT" branch --show-current)"
+    [[ "$branch" == main ]] || die \
+        "dotfiles checkout must be on main, not ${branch:-a detached HEAD}"
+    if existing="$(git -C "$REPO_ROOT" remote get-url upstream 2>/dev/null)"; then
+        [[ "$existing" == "$UPSTREAM_URL" ]] || die \
+            "remote 'upstream' is $existing, expected $UPSTREAM_URL"
+    else
+        git -C "$REPO_ROOT" remote add upstream "$UPSTREAM_URL"
+        log "added course update remote: $UPSTREAM_URL"
+    fi
+    git -C "$REPO_ROOT" remote get-url origin >/dev/null 2>&1 || die \
+        "missing personal 'origin' remote; clone your seeded repository first"
+    # `git pull` receives course updates; `git push` still submits to the
+    # student's personal origin. Merge, rather than rebase, preserves the
+    # common template history and exposes conflicts in student-edited files.
+    git -C "$REPO_ROOT" config branch.main.remote upstream
+    git -C "$REPO_ROOT" config branch.main.merge refs/heads/main
+    git -C "$REPO_ROOT" config remote.pushDefault origin
+    git -C "$REPO_ROOT" config pull.rebase false
+}
+
+# Department home directories are quota'd, and the toolchain (Node tree,
+# Claude/Codex npm installs, uv caches) approaches a gigabyte. Failing
+# here beats a confusing npm ENOSPC halfway through. df reflects the
+# NFS/ZFS quota on department homes; where it can't answer, skip the
+# check rather than block. DOTFILES_MIN_FREE_MB=0 disables it.
+require_free_space() {
+    local dir="$1" min_mb="$2" avail_kb
+    [[ "$min_mb" == 0 ]] && return 0
+    avail_kb="$(df -Pk "$dir" 2>/dev/null | awk 'NR==2 {print $4}')" || return 0
+    [[ -n "$avail_kb" ]] || return 0
+    if (( avail_kb < min_mb * 1024 )); then
+        die "less than ${min_mb} MB free in ${dir} ($((avail_kb / 1024)) MB). \
+The toolchain needs roughly 1 GB. Free space (old caches: ~/.npm, \
+~/.cache/uv) or set DOTFILES_MIN_FREE_MB=0 to override."
+    fi
+}
+
+platform() {
+    local os arch
+    os="$(uname -s)"
+    arch="$(uname -m)"
+    case "$os:$arch" in
+        Linux:x86_64) echo "linux amd64 x64 x86_64-unknown-linux" ;;
+        Linux:aarch64|Linux:arm64) echo "linux arm64 arm64 aarch64-unknown-linux" ;;
+        Darwin:x86_64) echo "darwin amd64 x64 x86_64-apple-darwin" ;;
+        Darwin:arm64) echo "darwin arm64 arm64 aarch64-apple-darwin" ;;
+        MSYS*|MINGW*|CYGWIN*) die \
+            "native Windows shell detected; ./setup runs on WSL, Linux, or macOS — see guides/windows.md" ;;
+        *) die "unsupported platform: $os $arch" ;;
+    esac
+}
+
+release_url() {
+    local repo="$1" tag="$2" asset="$3"
+    printf 'https://github.com/%s/releases/download/%s/%s' \
+        "$repo" "$tag" "$asset"
+}
+
+download_asset() {
+    local url="$1"
+    local out="$2"
+    if have curl; then
+        curl -fsSL "$url" -o "$out"
+    elif have wget; then
+        wget -q "$url" -O "$out"
+    else
+        die "need curl or wget to download $url"
+    fi
+}
+
+install_tar_binaries() {
+    local url="$1"
+    shift
+    local tmp archive bin found
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' RETURN
+    archive="$tmp/asset"
+    log "downloading ${url##*/}"
+    download_asset "$url" "$archive"
+    # macOS assets may be zips (gh ships macOS_*.zip); bsdtar, the tar on
+    # macOS, extracts both formats. Linux assets are all tarballs.
+    tar -xf "$archive" -C "$tmp"
+    for bin in "$@"; do
+        found="$(find "$tmp" -type f -name "$bin" | head -n 1)"
+        [[ -n "$found" ]] || die "${url##*/} did not contain $bin"
+        install -m 0755 "$found" "$LOCAL_BIN/$bin"
+    done
+}
+
+install_single_binary() {
+    local url="$1"
+    local name="$2"
+    local tmp
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' RETURN
+    log "downloading ${url##*/}"
+    download_asset "$url" "$tmp/$name"
+    install -m 0755 "$tmp/$name" "$LOCAL_BIN/$name"
+}
+
+install_uv() {
+    if ! should_install uv; then
+        return
+    fi
+    log "installing uv"
+    if have curl; then
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+    elif have wget; then
+        wget -qO- https://astral.sh/uv/install.sh | sh
+    else
+        die "need curl or wget to install uv"
+    fi
+}
+
+install_node() {
+    if ! should_install node; then
+        return
+    fi
+    read -r os _ node_arch _ < <(platform)
+    local node_platform url tmp archive dest
+    node_platform="${os}-${node_arch}"
+    url="https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-${node_platform}.tar.xz"
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' RETURN
+    archive="$tmp/node.tar.xz"
+    dest="${HOME}/.local/node-${NODE_VERSION}-${node_platform}"
+    log "installing Node.js $NODE_VERSION"
+    download_asset "$url" "$archive"
+    rm -rf "$dest"
+    mkdir -p "$dest"
+    tar -xJf "$archive" -C "$dest" --strip-components=1
+    ln -sf "$dest/bin/node" "$LOCAL_BIN/node"
+    ln -sf "$dest/bin/npm" "$LOCAL_BIN/npm"
+    ln -sf "$dest/bin/npx" "$LOCAL_BIN/npx"
+}
+
+install_release_tools() {
+    if [[ "$SKIP_INSTALL" == 1 ]]; then
+        log "DOTFILES_SKIP_INSTALL=1; skipping release downloads"
+        return
+    fi
+
+    require_free_space "$HOME" "$MIN_FREE_MB"
+
+    read -r os gh_arch _ triple < <(platform)
+    local gh_asset rg_arch fd_arch fzf_arch age_arch sops_arch jq_arch
+    if [[ "$os" == "linux" ]]; then
+        gh_asset="gh_${GH_VERSION}_linux_${gh_arch}.tar.gz"
+        rg_arch="${triple}-musl"
+        fd_arch="${triple}-gnu"
+        fzf_arch="linux_${gh_arch}"
+        age_arch="linux-${gh_arch}"
+        sops_arch="linux.${gh_arch}"
+        jq_arch="linux-${gh_arch}"
+    else
+        # gh names its macOS assets macOS_*.zip, not darwin_*.tar.gz.
+        gh_asset="gh_${GH_VERSION}_macOS_${gh_arch}.zip"
+        rg_arch="${triple}"
+        fd_arch="${triple}"
+        fzf_arch="darwin_${gh_arch}"
+        age_arch="darwin-${gh_arch}"
+        sops_arch="darwin.${gh_arch}"
+        jq_arch="macos-${gh_arch}"
+    fi
+
+    install_uv
+    install_node
+
+    if should_install gh; then
+        install_tar_binaries \
+            "$(release_url cli/cli "v${GH_VERSION}" "$gh_asset")" gh
+    fi
+    if should_install rg; then
+        install_tar_binaries \
+            "$(release_url BurntSushi/ripgrep "${RG_VERSION}" \
+                "ripgrep-${RG_VERSION}-${rg_arch}.tar.gz")" rg
+    fi
+    if should_install fd; then
+        install_tar_binaries \
+            "$(release_url sharkdp/fd "v${FD_VERSION}" \
+                "fd-v${FD_VERSION}-${fd_arch}.tar.gz")" fd
+    fi
+    if should_install fzf; then
+        install_tar_binaries \
+            "$(release_url junegunn/fzf "v${FZF_VERSION}" \
+                "fzf-${FZF_VERSION}-${fzf_arch}.tar.gz")" fzf
+    fi
+    if should_install age || should_install age-keygen; then
+        install_tar_binaries \
+            "$(release_url FiloSottile/age "v${AGE_VERSION}" \
+                "age-v${AGE_VERSION}-${age_arch}.tar.gz")" age age-keygen
+    fi
+    if should_install sops; then
+        install_single_binary \
+            "$(release_url getsops/sops "v${SOPS_VERSION}" \
+                "sops-v${SOPS_VERSION}.${sops_arch}")" sops
+    fi
+    if should_install jq; then
+        install_single_binary \
+            "$(release_url jqlang/jq "jq-${JQ_VERSION}" "jq-${jq_arch}")" jq
+    fi
+}
+
+install_agent_tools() {
+    if [[ "$SKIP_INSTALL" == 1 ]]; then
+        return
+    fi
+    have npm || die "npm missing after Node install"
+    if should_install claude; then
+        log "installing Claude Code CLI"
+        npm install --global --prefix "${HOME}/.local" @anthropic-ai/claude-code
+    fi
+    if should_install codex; then
+        log "installing Codex CLI"
+        npm install --global --prefix "${HOME}/.local" \
+            "@openai/codex@$(tr -d '[:space:]' <"${REPO_ROOT}/codex/pinned-version")"
+    fi
+    have uv || die "uv missing after install"
+    log "installing managed Python 3.11"
+    uv python install 3.11
+    log "installing Python quality tools through uv"
+    if [[ "$UPDATE" == 1 ]]; then
+        uv tool install --force ruff
+        uv tool install --force pyright
+    else
+        uv tool install ruff || true
+        uv tool install pyright || true
+    fi
+}
+
+ensure_age_key() {
+    local key_file="${HOME}/.config/sops/age/keys.txt"
+    mkdir -p "$(dirname "$key_file")"
+    if [[ -f "$key_file" ]]; then
+        log "age key already exists; leaving it untouched"
+        return
+    fi
+    have age-keygen || die "age-keygen missing; cannot create SOPS age key"
+    log "generating age key"
+    age-keygen -o "$key_file"
+    chmod 0600 "$key_file"
+}
+
+ensure_sops_yaml() {
+    local key_file="${HOME}/.config/sops/age/keys.txt"
+    local sops_yaml="${REPO_ROOT}/.sops.yaml"
+    local recipient
+    if [[ -f "$sops_yaml" ]]; then
+        log ".sops.yaml already exists; leaving it untouched"
+        return
+    fi
+    have age-keygen || die "age-keygen missing; cannot derive public recipient"
+    recipient="$(age-keygen -y "$key_file" | tail -n 1)"
+    [[ -n "$recipient" ]] || die "could not derive age public recipient"
+    cat >"$sops_yaml" <<EOF
+creation_rules:
+  - path_regex: secrets/.*\\.env$
+    age: ${recipient}
+EOF
+    log "wrote .sops.yaml for this age recipient"
+}
+
+main() {
+    cd "$REPO_ROOT"
+    platform >/dev/null    # fail on unsupported platforms before mutating HOME
+    configure_git_updates
+    ensure_path
+    install_release_tools
+    install_agent_tools
+    ensure_age_key
+    ensure_sops_yaml
+    ./links
+    log "done; open a new terminal, authenticate gh and Codex, then" \
+        "run ./self-check"
+}
+
+main "$@"

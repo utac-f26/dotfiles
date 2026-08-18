@@ -1,0 +1,289 @@
+#!/usr/bin/env bash
+# Send a prompt file to Claude Code and print only the response-file path.
+
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+usage: claude-ask PROMPT_FILE [OPTIONS]
+
+Options:
+  --output FILE             Response file (default: PROMPT.resp.md)
+  --session NAME            Resume this named session, or create and register it
+  --fresh                   Start a new unnamed session (the default)
+  --continue                Resume Claude's most recent session
+  --read-only               Grant only Read, Grep, and Glob
+  --tools LIST              Grant an explicit comma-separated tool list
+  --model MODEL             Select a Claude model (default: Claude Code default)
+  --effort LEVEL            low, medium, high, xhigh, or max
+  --budget USD              Optional maximum API spend
+  --timeout SEC             Stop after this many seconds; 0 disables timeout
+  --permission-mode MODE    Claude permission mode (default: dontAsk)
+  --system-prompt TEXT      Replace Claude's system prompt
+  --append-system-prompt TEXT
+                            Append to Claude's system prompt
+
+The default grants no tools. Claude's JSON result is split into the response
+file and OUTPUT.meta.json. Diagnostics go to stderr; stdout contains only the
+response-file path.
+EOF
+}
+
+PROMPT=""
+OUTPUT=""
+NAME=""
+FRESH=0
+CONTINUE=0
+READ_ONLY=0
+MODEL="${CLAUDE_ASK_MODEL:-}"
+EFFORT="${CLAUDE_ASK_EFFORT:-}"
+BUDGET="${CLAUDE_ASK_MAX_BUDGET_USD:-}"
+TIMEOUT_SECONDS="${CLAUDE_ASK_TIMEOUT:-600}"
+TOOLS="${CLAUDE_ASK_TOOLS:-}"
+PERMISSION_MODE="${CLAUDE_ASK_PERMISSION_MODE:-dontAsk}"
+SYSTEM_PROMPT=""
+APPEND_SYSTEM_PROMPT=""
+
+while (($#)); do
+    case "$1" in
+        --output) OUTPUT="${2:-}"; shift 2 ;;
+        --session) NAME="${2:-}"; shift 2 ;;
+        --fresh) FRESH=1; shift ;;
+        --continue) CONTINUE=1; shift ;;
+        --read-only) READ_ONLY=1; shift ;;
+        --tools) TOOLS="${2:-}"; shift 2 ;;
+        --model) MODEL="${2:-}"; shift 2 ;;
+        --effort) EFFORT="${2:-}"; shift 2 ;;
+        --budget|--max-budget-usd) BUDGET="${2:-}"; shift 2 ;;
+        --timeout) TIMEOUT_SECONDS="${2:-}"; shift 2 ;;
+        --permission-mode) PERMISSION_MODE="${2:-}"; shift 2 ;;
+        --system-prompt) SYSTEM_PROMPT="${2:-}"; shift 2 ;;
+        --append-system-prompt) APPEND_SYSTEM_PROMPT="${2:-}"; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        --*) echo "claude-ask: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+        *)
+            if [[ -z "$PROMPT" ]]; then
+                PROMPT="$1"
+                shift
+            else
+                echo "claude-ask: extra argument: $1" >&2
+                exit 2
+            fi
+            ;;
+    esac
+done
+
+[[ -n "$PROMPT" ]] || { echo "claude-ask: PROMPT_FILE required" >&2; exit 2; }
+[[ -f "$PROMPT" ]] || { echo "claude-ask: not a file: $PROMPT" >&2; exit 2; }
+if [[ "$FRESH" == 1 && -n "$NAME" ]]; then
+    echo "claude-ask: --fresh and --session are mutually exclusive" >&2
+    exit 2
+fi
+if [[ "$CONTINUE" == 1 && ( -n "$NAME" || "$FRESH" == 1 ) ]]; then
+    echo "claude-ask: --continue cannot combine with --session or --fresh" >&2
+    exit 2
+fi
+if [[ -n "$NAME" && ! "$NAME" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+    echo "claude-ask: invalid session name '$NAME' (allowed: [A-Za-z0-9_.-]+)" >&2
+    exit 2
+fi
+case "$TIMEOUT_SECONDS" in
+    ''|*[!0-9]*)
+        echo "claude-ask: --timeout must be a non-negative integer" >&2
+        exit 2
+        ;;
+esac
+if [[ -n "$EFFORT" ]]; then
+    case "$EFFORT" in
+        low|medium|high|xhigh|max) ;;
+        *) echo "claude-ask: invalid --effort: $EFFORT" >&2; exit 2 ;;
+    esac
+fi
+if [[ -n "$BUDGET" && ! "$BUDGET" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "claude-ask: --budget must be a non-negative number" >&2
+    exit 2
+fi
+command -v claude >/dev/null || {
+    echo "claude-ask: missing required command: claude; run ./setup and retry" >&2
+    exit 1
+}
+command -v jq >/dev/null || {
+    echo "claude-ask: missing required command: jq; run ./setup and retry" >&2
+    exit 1
+}
+
+if [[ "$READ_ONLY" == 1 ]]; then
+    TOOLS="Read,Grep,Glob"
+fi
+if [[ -z "$OUTPUT" ]]; then
+    case "$PROMPT" in
+        *.md) OUTPUT="${PROMPT%.md}.resp.md" ;;
+        *) OUTPUT="${PROMPT}.resp" ;;
+    esac
+fi
+META="${OUTPUT}.meta.json"
+
+REGISTRY_DIR="${CLAUDE_HOME:-$HOME/.claude}/ask-sessions-by-name"
+REG=""
+RESUME_ID=""
+if [[ -n "$NAME" ]]; then
+    REG="${REGISTRY_DIR}/${NAME}.json"
+    [[ -f "$REG" ]] && RESUME_ID="$(jq -r '.id // empty' "$REG")"
+fi
+
+quarantine_registry() {
+    local stamp stale counter=2
+    stamp="$(date +%Y%m%dT%H%M%S)"
+    stale="${REG}.stale.${stamp}"
+    while [[ -e "$stale" ]]; do
+        stale="${REG}.stale.${stamp}.${counter}"
+        counter=$((counter + 1))
+    done
+    mv "$REG" "$stale"
+    echo "claude-ask: moved stale session registry to $stale; retry starts fresh" >&2
+}
+
+CLAUDE_ARGS=(-p --output-format json)
+if [[ -n "$MODEL" ]]; then
+    CLAUDE_ARGS+=(--model "$MODEL")
+fi
+if [[ -n "$EFFORT" ]]; then
+    CLAUDE_ARGS+=(--effort "$EFFORT")
+fi
+if [[ "$PERMISSION_MODE" != default ]]; then
+    CLAUDE_ARGS+=(--permission-mode "$PERMISSION_MODE")
+fi
+if [[ -n "$BUDGET" ]]; then
+    CLAUDE_ARGS+=(--max-budget-usd "$BUDGET")
+fi
+# Passing an empty value is intentional: omitting --tools lets Claude fall
+# back to its normal tool defaults instead of enforcing the no-tools policy.
+CLAUDE_ARGS+=(--tools "$TOOLS")
+if [[ -n "$TOOLS" ]]; then
+    # Keep the requested tools allowed even when a non-interactive subprocess
+    # resolves to Claude's default permission mode.
+    CLAUDE_ARGS+=(--allowedTools "$TOOLS")
+fi
+if [[ -n "$RESUME_ID" ]]; then
+    CLAUDE_ARGS+=(--resume "$RESUME_ID")
+elif [[ "$CONTINUE" == 1 ]]; then
+    CLAUDE_ARGS+=(--continue)
+fi
+if [[ -n "$SYSTEM_PROMPT" ]]; then
+    CLAUDE_ARGS+=(--system-prompt "$SYSTEM_PROMPT")
+fi
+if [[ -n "$APPEND_SYSTEM_PROMPT" ]]; then
+    CLAUDE_ARGS+=(--append-system-prompt "$APPEND_SYSTEM_PROMPT")
+fi
+
+TEMP_JSON="$(mktemp "${TMPDIR:-/tmp}/claude-ask.XXXXXX")"
+TEMP_ERR="$(mktemp "${TMPDIR:-/tmp}/claude-ask.err.XXXXXX")"
+TEMP_OUT="$(mktemp "${OUTPUT}.tmp.XXXXXX")"
+TEMP_META="$(mktemp "${META}.tmp.XXXXXX")"
+trap 'rm -f "$TEMP_JSON" "$TEMP_ERR" "$TEMP_OUT" "$TEMP_META"' EXIT
+
+echo "claude-ask: timeout=${TIMEOUT_SECONDS}s tools=${TOOLS:-<none>}" >&2
+echo "claude-ask: prompt=$PROMPT output=$OUTPUT" >&2
+
+set +e
+# Buffer stderr so stale-session detection has a complete, portable input.
+# Process substitution depends on /dev/fd behavior that is unreliable in the
+# macOS/sandbox environments this template supports; the loop below provides a
+# heartbeat while Claude runs, and diagnostics are replayed immediately after.
+claude "${CLAUDE_ARGS[@]}" <"$PROMPT" >"$TEMP_JSON" 2>"$TEMP_ERR" &
+PID=$!
+TIMED_OUT=0
+if [[ "$TIMEOUT_SECONDS" -gt 0 ]]; then
+    START="$(date +%s)"
+    while kill -0 "$PID" 2>/dev/null; do
+        NOW="$(date +%s)"
+        ELAPSED=$((NOW - START))
+        if [[ "$ELAPSED" -ge "$TIMEOUT_SECONDS" ]]; then
+            TIMED_OUT=1
+            kill "$PID" 2>/dev/null
+            sleep 1
+            kill -9 "$PID" 2>/dev/null
+            break
+        fi
+        if [[ "$ELAPSED" -gt 0 && $((ELAPSED % 30)) -eq 0 ]]; then
+            echo "claude-ask: still running (${ELAPSED}s elapsed)" >&2
+        fi
+        sleep 1
+    done
+fi
+wait "$PID" 2>/dev/null
+STATUS=$?
+set -e
+[[ ! -s "$TEMP_ERR" ]] || cat "$TEMP_ERR" >&2
+
+if [[ "$TIMED_OUT" == 1 ]]; then
+    echo "claude-ask: timed out after ${TIMEOUT_SECONDS}s" >&2
+    exit 124
+fi
+if [[ "$STATUS" -ne 0 ]]; then
+    echo "claude-ask: Claude exited with status $STATUS" >&2
+    [[ ! -s "$TEMP_JSON" ]] || sed 's/^/  /' "$TEMP_JSON" >&2
+    # Claude Code 2.1.76 emitted "No conversation found with session ID" on
+    # stderr in an observed named-review failure. Some JSON-mode failures put
+    # the same diagnostic in the JSON result, so inspect both channels.
+    if [[ -n "$RESUME_ID" && -f "$REG" ]] \
+        && grep -Eqi 'no conversation|session.*not found|invalid session' \
+            "$TEMP_ERR" "$TEMP_JSON"
+    then
+        quarantine_registry
+    fi
+    exit "$STATUS"
+fi
+if ! jq -e \
+    '.type == "result" and (.is_error | not) and (.result | type == "string")' \
+    "$TEMP_JSON" >/dev/null
+then
+    echo "claude-ask: unexpected or error JSON result" >&2
+    sed 's/^/  /' "$TEMP_JSON" >&2
+    exit 1
+fi
+
+jq -r '.result' "$TEMP_JSON" >"$TEMP_OUT"
+[[ -s "$TEMP_OUT" ]] || {
+    echo "claude-ask: Claude produced an empty response" >&2
+    exit 1
+}
+jq 'del(.result)' "$TEMP_JSON" >"$TEMP_META"
+mv "$TEMP_OUT" "$OUTPUT"
+mv "$TEMP_META" "$META"
+
+if [[ -n "$NAME" ]]; then
+    SID="$(jq -r '.session_id // empty' "$TEMP_JSON")"
+    if [[ -z "$SID" ]]; then
+        echo "claude-ask: response omitted session_id; '$NAME' not registered" >&2
+        echo "agent-review-response-complete: session-registration-failed" >&2
+        exit 1
+    fi
+    NOW="$(date +%Y-%m-%dT%H:%M:%S%z)"
+    mkdir -p "$REGISTRY_DIR"
+    if [[ -f "$REG" ]]; then
+        jq \
+            --arg id "$SID" \
+            --arg last "$NOW" \
+            --arg output "$OUTPUT" \
+            --arg meta "$META" \
+            '.id = $id | .last_used = $last | .last_output = $output
+             | .last_meta = $meta' \
+            "$REG" >"${REG}.tmp"
+    else
+        jq -n \
+            --arg name "$NAME" \
+            --arg id "$SID" \
+            --arg created "$NOW" \
+            --arg last "$NOW" \
+            --arg output "$OUTPUT" \
+            --arg meta "$META" \
+            '{name: $name, id: $id, created: $created, last_used: $last,
+              last_output: $output, last_meta: $meta}' \
+            >"${REG}.tmp"
+        echo "claude-ask: registered session '$NAME' -> $SID" >&2
+    fi
+    mv "${REG}.tmp" "$REG"
+fi
+
+printf '%s\n' "$OUTPUT"

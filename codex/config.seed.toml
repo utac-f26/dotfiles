@@ -1,0 +1,15 @@
+# Stable, student-owned Codex defaults belong here.
+#
+# ./links copies this file to ~/.codex/config.toml only when the live config is
+# absent. Codex owns and rewrites the live file with machine and project state,
+# so it is intentionally not symlinked into this repository.
+#
+# HW0: this file is the tracked source of truth for your Codex policy.
+# Edit it with your agent per guides/permissions.md, mirror the same keys
+# into ~/.codex/config.toml, and keep it to exactly these keys —
+# ./self-check compares the two and reports drift.
+
+# Predictable, portable safety defaults. Leave the model unpinned so Codex can
+# follow the student's account and the course's current model guidance.
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"

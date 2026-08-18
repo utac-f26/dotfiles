@@ -1,0 +1,226 @@
+#!/usr/bin/env bash
+# Send a prompt file to Codex and print only the response-file path.
+
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+usage: codex-ask PROMPT_FILE [OPTIONS]
+
+Options:
+  --output FILE       Response file (default: PROMPT.resp.md)
+  --session NAME      Resume this named session, or create and register it
+  --fresh             Start a new unnamed session
+  --read-only         Run Codex with its read-only sandbox
+  --model MODEL       Select a Codex model
+  --timeout SEC       Stop after this many seconds; 0 disables timeout
+  -c KEY=VALUE        Forward a Codex config override (repeatable)
+
+Without --session or --fresh, resume Codex's most recent session. Codex's
+transcript goes to stderr; stdout contains only the response-file path.
+EOF
+}
+
+PROMPT=""
+OUTPUT=""
+NAME=""
+MODEL=""
+FRESH=0
+READ_ONLY=0
+TIMEOUT_SECONDS="${CODEX_ASK_TIMEOUT:-600}"
+CONFIG_OVERRIDES=()
+
+while (($#)); do
+    case "$1" in
+        --output) OUTPUT="${2:-}"; shift 2 ;;
+        --session) NAME="${2:-}"; shift 2 ;;
+        --fresh) FRESH=1; shift ;;
+        --read-only) READ_ONLY=1; shift ;;
+        --model) MODEL="${2:-}"; shift 2 ;;
+        --timeout) TIMEOUT_SECONDS="${2:-}"; shift 2 ;;
+        -c) CONFIG_OVERRIDES+=(-c "${2:-}"); shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        --*) echo "codex-ask: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+        *)
+            if [[ -z "$PROMPT" ]]; then
+                PROMPT="$1"
+                shift
+            else
+                echo "codex-ask: extra argument: $1" >&2
+                exit 2
+            fi
+            ;;
+    esac
+done
+
+[[ -n "$PROMPT" ]] || { echo "codex-ask: PROMPT_FILE required" >&2; exit 2; }
+[[ -f "$PROMPT" ]] || { echo "codex-ask: not a file: $PROMPT" >&2; exit 2; }
+if [[ "$FRESH" == 1 && -n "$NAME" ]]; then
+    echo "codex-ask: --fresh and --session are mutually exclusive" >&2
+    exit 2
+fi
+if [[ -n "$NAME" && ! "$NAME" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+    echo "codex-ask: invalid session name '$NAME' (allowed: [A-Za-z0-9_.-]+)" >&2
+    exit 2
+fi
+case "$TIMEOUT_SECONDS" in
+    ''|*[!0-9]*)
+        echo "codex-ask: --timeout must be a non-negative integer" >&2
+        exit 2
+        ;;
+esac
+command -v codex >/dev/null || {
+    echo "codex-ask: missing required command: codex; run ./setup and retry" >&2
+    exit 1
+}
+if [[ -n "$NAME" ]]; then
+    command -v jq >/dev/null || {
+        echo "codex-ask: missing required command: jq for named sessions" >&2
+        exit 1
+    }
+fi
+
+if [[ -z "$OUTPUT" ]]; then
+    case "$PROMPT" in
+        *.md) OUTPUT="${PROMPT%.md}.resp.md" ;;
+        *) OUTPUT="${PROMPT}.resp" ;;
+    esac
+fi
+
+REGISTRY_DIR="${CODEX_HOME:-$HOME/.codex}/sessions-by-name"
+REG=""
+RESUME_ID=""
+if [[ -n "$NAME" ]]; then
+    REG="${REGISTRY_DIR}/${NAME}.json"
+    [[ -f "$REG" ]] && RESUME_ID="$(jq -r '.id // empty' "$REG")"
+fi
+
+quarantine_registry() {
+    local stamp stale counter=2
+    stamp="$(date +%Y%m%dT%H%M%S)"
+    stale="${REG}.stale.${stamp}"
+    while [[ -e "$stale" ]]; do
+        stale="${REG}.stale.${stamp}.${counter}"
+        counter=$((counter + 1))
+    done
+    mv "$REG" "$stale"
+    echo "codex-ask: moved stale session registry to $stale; retry starts fresh" >&2
+}
+
+# Never leave a prior answer looking like the result of a failed call.
+: >"$OUTPUT"
+
+CODEX_ARGS=(exec)
+if [[ "$READ_ONLY" == 1 ]]; then
+    CODEX_ARGS+=(--sandbox read-only)
+fi
+if [[ -n "$RESUME_ID" ]]; then
+    CODEX_ARGS+=(resume "$RESUME_ID")
+elif [[ "$FRESH" == 1 || -n "$NAME" ]]; then
+    : # A first-use name and --fresh both start a new session.
+else
+    CODEX_ARGS+=(resume --last)
+fi
+if [[ -n "$MODEL" ]]; then
+    CODEX_ARGS+=(--model "$MODEL")
+fi
+CODEX_ARGS+=(-o "$OUTPUT")
+
+TEMP_OUT="$(mktemp "${TMPDIR:-/tmp}/codex-ask.XXXXXX")"
+trap 'rm -f "$TEMP_OUT"' EXIT
+
+set +e
+# Expanding an empty array under `set -u` fails in Apple's Bash 3.2, so keep
+# the two direct invocations. Buffering makes the child PID available to the
+# portable watchdog; progress remains visible through the heartbeat below.
+if ((${#CONFIG_OVERRIDES[@]})); then
+    command codex "${CONFIG_OVERRIDES[@]}" "${CODEX_ARGS[@]}" - \
+        <"$PROMPT" >"$TEMP_OUT" 2>&1 &
+else
+    command codex "${CODEX_ARGS[@]}" - <"$PROMPT" >"$TEMP_OUT" 2>&1 &
+fi
+PID=$!
+TIMED_OUT=0
+if [[ "$TIMEOUT_SECONDS" -gt 0 ]]; then
+    START="$(date +%s)"
+    while kill -0 "$PID" 2>/dev/null; do
+        NOW="$(date +%s)"
+        ELAPSED=$((NOW - START))
+        if [[ "$ELAPSED" -ge "$TIMEOUT_SECONDS" ]]; then
+            TIMED_OUT=1
+            kill "$PID" 2>/dev/null
+            sleep 1
+            kill -9 "$PID" 2>/dev/null
+            break
+        fi
+        if [[ "$ELAPSED" -gt 0 && $((ELAPSED % 30)) -eq 0 ]]; then
+            echo "codex-ask: still running (${ELAPSED}s elapsed)" >&2
+        fi
+        sleep 1
+    done
+fi
+wait "$PID" 2>/dev/null
+STATUS=$?
+set -e
+[[ ! -s "$TEMP_OUT" ]] || cat "$TEMP_OUT" >&2
+
+if [[ "$TIMED_OUT" == 1 ]]; then
+    echo "codex-ask: timed out after ${TIMEOUT_SECONDS}s" >&2
+    exit 124
+fi
+
+if [[ "$STATUS" -ne 0 ]]; then
+    # Current Codex CLI releases report missing resumes with "session not
+    # found" or "no session/conversation"; keep the manual fallback in the
+    # student docs because error wording is not a stable interface.
+    if [[ -n "$RESUME_ID" && -f "$REG" ]] \
+        && grep -Eqi 'no (conversation|session)|session.*not found|invalid session' \
+            "$TEMP_OUT"
+    then
+        quarantine_registry
+    fi
+    exit "$STATUS"
+fi
+
+[[ -s "$OUTPUT" ]] || {
+    echo "codex-ask: Codex produced no response" >&2
+    exit 1
+}
+
+if [[ -n "$NAME" ]]; then
+    NOW="$(date +%Y-%m-%dT%H:%M:%S%z)"
+    if [[ -z "$RESUME_ID" ]]; then
+        SID="$(
+            grep -oE 'session id: [0-9a-f-]+' "$TEMP_OUT" \
+                | head -1 | awk '{print $3}' || true
+        )"
+        if [[ -n "$SID" ]]; then
+            mkdir -p "$REGISTRY_DIR"
+            ROLLOUT="$(
+                find "${CODEX_HOME:-$HOME/.codex}/sessions" \
+                    -name "*${SID}*.jsonl" 2>/dev/null | head -1 || true
+            )"
+            jq -n \
+                --arg name "$NAME" \
+                --arg id "$SID" \
+                --arg rollout "$ROLLOUT" \
+                --arg created "$NOW" \
+                --arg last "$NOW" \
+                '{name: $name, id: $id, rollout: $rollout,
+                  created: $created, last_used: $last}' \
+                >"${REG}.tmp"
+            mv "${REG}.tmp" "$REG"
+            echo "codex-ask: registered session '$NAME' -> $SID" >&2
+        else
+            echo "codex-ask: could not read Codex's session id; " \
+                "'$NAME' was not registered" >&2
+            echo "agent-review-response-complete: session-registration-failed" >&2
+            exit 1
+        fi
+    else
+        jq --arg last "$NOW" '.last_used = $last' "$REG" >"${REG}.tmp"
+        mv "${REG}.tmp" "$REG"
+    fi
+fi
+
+printf '%s\n' "$OUTPUT"

@@ -1,0 +1,995 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# ///
+# pyright: strict
+
+"""Drive a bounded, read-only, multi-round cross-model review."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+from dataclasses import asdict, dataclass, replace
+from datetime import UTC, date, datetime
+from pathlib import Path
+from typing import Literal, cast
+
+Reviewer = Literal["codex", "claude"]
+Phase = Literal["spec", "plan", "code", "results"]
+Classification = Literal["PREMISE", "QUALITY"]
+Severity = Literal["BLOCKER", "IMPROVE", "NIT"]
+
+REVIEWERS: tuple[Reviewer, ...] = ("codex", "claude")
+PHASES: tuple[Phase, ...] = ("spec", "plan", "code", "results")
+MEMO_SECTIONS = ("Addressing", "Pushing back", "Investigating", "Acknowledged")
+MEMO_REFERENCE_RE = re.compile(r"^(?:[-*]\s+)?#(\d+)(?:\s|:|->|$)")
+MAX_TRACKED_DIFF_BYTES = 512_000
+MAX_UNTRACKED_FILE_BYTES = 64_000
+MAX_UNTRACKED_TOTAL_BYTES = 256_000
+RESPONSE_COMPLETE_MARKER = (
+    "agent-review-response-complete: session-registration-failed"
+)
+FINDING_RE = re.compile(
+    r"^### Finding (\d+): ([^\n]+)\n"
+    r"(?:[ \t]*\n)?"
+    r"\*\*Class:\*\* (PREMISE|QUALITY)\n"
+    r"\*\*Severity:\*\* (BLOCKER|IMPROVE|NIT)\n"
+    r"\n(.*?)(?=\n### Finding \d+:|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+
+
+class ReviewError(RuntimeError):
+    """A user-actionable review workflow error."""
+
+
+@dataclass(frozen=True, slots=True)
+class Finding:
+    number: int
+    label: str
+    classification: Classification
+    severity: Severity
+    detail: str
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotBase:
+    sha: str
+    reference: str
+    branch: str
+    head: str
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewState:
+    reviewer: Reviewer
+    session: str
+    repo: str
+    phase: Phase
+    artifact: str
+    round: int
+    statuses: dict[str, str]
+    finding_numbers: tuple[int, ...] = ()
+    blocked: bool = False
+    response: str | None = None
+    merge_base: str | None = None
+    base_ref: str | None = None
+    last_dispositioned_round: int | None = None
+
+
+def sanitize_name(value: str) -> str:
+    """Return a registry-safe session-name component."""
+    value = re.sub(r"[^A-Za-z0-9_.-]+", "-", value)
+    value = re.sub(r"-+", "-", value)
+    return value.strip("-._")
+
+
+def derive_session_name(
+    *,
+    explicit: str | None,
+    branch: str,
+    artifact: Path,
+    cwd_name: str,
+    today: date,
+    reviews_root: Path,
+) -> str:
+    """Choose a stable, collision-free session name."""
+    if explicit is not None:
+        name = sanitize_name(explicit)
+        if not name or name != explicit:
+            raise ReviewError(
+                "invalid session name; use letters, digits, '.', '_', or '-'"
+            )
+        return name
+    source = branch if branch not in {"main", "master", "HEAD", ""} else artifact.stem
+    source = sanitize_name(source) or sanitize_name(cwd_name) or "review"
+    base = f"{source}-{today:%Y%m%d}"
+    name = base
+    counter = 2
+    while (reviews_root / name).exists():
+        name = f"{base}-{counter}"
+        counter += 1
+    return name
+
+
+def parse_findings(text: str) -> tuple[Finding, ...]:
+    """Parse the exact review response contract, rejecting surrounding prose."""
+    stripped = text.strip()
+    if stripped == "No findings.":
+        return ()
+    matches = tuple(FINDING_RE.finditer(stripped))
+    if not matches:
+        raise ReviewError("review response format is invalid")
+    cursor = 0
+    for match in matches:
+        if stripped[cursor : match.start()].strip():
+            raise ReviewError("review response format has unexpected prose")
+        cursor = match.end()
+    if stripped[cursor:].strip():
+        raise ReviewError("review response format has unexpected prose")
+    findings = tuple(
+        Finding(
+            number=int(match.group(1)),
+            label=match.group(2).strip(),
+            classification=cast(Classification, match.group(3)),
+            severity=cast(Severity, match.group(4)),
+            detail=match.group(5).strip(),
+        )
+        for match in matches
+    )
+    numbers = [finding.number for finding in findings]
+    if len(numbers) != len(set(numbers)):
+        raise ReviewError("review response format repeats a finding number")
+    if any(not finding.detail for finding in findings):
+        raise ReviewError("review response format requires finding details")
+    return findings
+
+
+def validate_monotonic_findings(
+    findings: tuple[Finding, ...], seen_numbers: tuple[int, ...]
+) -> None:
+    """Require increasing output order and prohibit reuse of withdrawn ids."""
+    numbers = [finding.number for finding in findings]
+    if any(number < 1 for number in numbers) or numbers != sorted(numbers):
+        raise ReviewError("finding numbers must be positive and monotonic")
+    seen = set(seen_numbers)
+    prior_max = max(seen, default=0)
+    reused = [
+        number
+        for number in numbers
+        if number not in seen and number <= prior_max
+    ]
+    if reused:
+        raise ReviewError(f"withdrawn finding numbers cannot be reused: {reused}")
+
+
+def validate_phase_transition(current: Phase, next_phase: Phase) -> None:
+    """Require forward, adjacent lifecycle transitions."""
+    index = PHASES.index(current)
+    if index == len(PHASES) - 1:
+        raise ReviewError("results is the final phase; finish the review")
+    expected = PHASES[index + 1]
+    if next_phase != expected:
+        raise ReviewError(f"next phase after {current} must be {expected}")
+
+
+def _memo_assignments(memo: str) -> dict[int, str]:
+    assignments: dict[int, str] = {}
+    current: str | None = None
+    seen_sections: set[str] = set()
+    for raw_line in memo.splitlines():
+        line = raw_line.strip()
+        if line.startswith("## "):
+            current = line[3:].strip()
+            if current not in MEMO_SECTIONS:
+                raise ReviewError(f"unknown memo section: {current}")
+            if current in seen_sections:
+                raise ReviewError(f"memo section repeated: {current}")
+            seen_sections.add(current)
+            continue
+        reference = MEMO_REFERENCE_RE.match(line)
+        if reference is not None and current is None:
+            raise ReviewError("memo finding appears outside a section")
+        if reference is not None:
+            number = int(reference.group(1))
+            if number in assignments:
+                raise ReviewError(f"finding #{number} must appear exactly once")
+            assignments[number] = cast(str, current)
+    missing_sections = set(MEMO_SECTIONS) - seen_sections
+    if missing_sections:
+        raise ReviewError("memo must contain all four disposition sections")
+    return assignments
+
+
+def validate_memo(
+    memo: str,
+    findings: tuple[Finding, ...],
+    *,
+    premise_override: bool = False,
+) -> dict[int, str]:
+    """Require one valid disposition for every finding and no unknown ids."""
+    assignments = _memo_assignments(memo)
+    expected = {finding.number for finding in findings}
+    actual = set(assignments)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        unknown = sorted(actual - expected)
+        raise ReviewError(
+            f"each finding must appear exactly once (missing={missing}, "
+            f"unknown={unknown})"
+        )
+    by_number = {finding.number: finding for finding in findings}
+    for number, section in assignments.items():
+        finding = by_number[number]
+        if section == "Acknowledged" and finding.severity != "NIT":
+            raise ReviewError("only NIT findings may be Acknowledged")
+        overridden_premise = (
+            premise_override
+            and finding.classification == "PREMISE"
+            and finding.severity == "BLOCKER"
+        )
+        if (
+            section == "Pushing back"
+            and finding.severity == "BLOCKER"
+            and not overridden_premise
+        ):
+            raise ReviewError("a BLOCKER cannot be handled by Pushing back")
+    return assignments
+
+
+def validate_closing_memo(
+    memo: str,
+    findings: tuple[Finding, ...],
+    *,
+    premise_override: bool,
+) -> None:
+    """Require every blocker to be resolved before closing a phase."""
+    assignments = validate_memo(
+        memo,
+        findings,
+        premise_override=premise_override,
+    )
+    unresolved = [
+        finding.number
+        for finding in findings
+        if finding.severity == "BLOCKER"
+        and assignments[finding.number] != "Addressing"
+        and not (
+            premise_override
+            and finding.classification == "PREMISE"
+            and assignments[finding.number] == "Pushing back"
+        )
+    ]
+    if unresolved:
+        raise ReviewError(
+            f"BLOCKER findings must be Addressing before close: {unresolved}"
+        )
+
+
+def require_premise_override(
+    findings: tuple[Finding, ...], reason: str | None
+) -> None:
+    blockers = [
+        finding.number
+        for finding in findings
+        if finding.classification == "PREMISE" and finding.severity == "BLOCKER"
+    ]
+    if blockers and not (reason and reason.strip()):
+        raise ReviewError(
+            f"PREMISE BLOCKER findings {blockers} require a human override reason"
+        )
+
+
+def _git(repo: Path, *args: str, check: bool = True) -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if check and completed.returncode != 0:
+        raise ReviewError(completed.stderr.strip() or f"git {' '.join(args)} failed")
+    return completed.stdout.strip()
+
+
+def _snapshot_base(repo: Path, explicit: str | None) -> SnapshotBase:
+    """Resolve an auditable code-review base without guessing on main."""
+    branch = _git(repo, "branch", "--show-current") or "HEAD"
+    head = _git(repo, "rev-parse", "HEAD")
+    if explicit is not None:
+        sha = _git(repo, "rev-parse", "--verify", f"{explicit}^{{commit}}")
+        return SnapshotBase(sha=sha, reference=explicit, branch=branch, head=head)
+    if branch in {"main", "master", "HEAD"}:
+        if _git(repo, "status", "--porcelain"):
+            return SnapshotBase(
+                sha=head,
+                reference="HEAD: uncommitted work only",
+                branch=branch,
+                head=head,
+            )
+        if branch == "HEAD":
+            raise ReviewError(
+                "code review from detached HEAD requires --base REF when the "
+                "tree is clean; pass the commit before the reviewed change"
+            )
+        raise ReviewError(
+            "code review on main requires --base REF when the tree is clean; "
+            "use --base HEAD for uncommitted work or the commit before a "
+            "committed change"
+        )
+    candidates = ("origin/main", "origin/master", "main", "master")
+    for candidate in candidates:
+        if not _git(repo, "rev-parse", "--verify", "--quiet", candidate, check=False):
+            continue
+        fork = _git(
+            repo,
+            "merge-base",
+            "--fork-point",
+            candidate,
+            "HEAD",
+            check=False,
+        )
+        if fork:
+            return SnapshotBase(
+                sha=fork,
+                reference=candidate,
+                branch=branch,
+                head=head,
+            )
+        base = _git(repo, "merge-base", candidate, "HEAD", check=False)
+        if base:
+            return SnapshotBase(
+                sha=base,
+                reference=candidate,
+                branch=branch,
+                head=head,
+            )
+    raise ReviewError("could not determine a feature merge base; pass --base REF")
+
+
+def render_round_prompt(
+    phase: Phase,
+    artifact: Path,
+    round_number: int,
+    memo: str | None,
+    diff_path: Path | None,
+    snapshot_provenance: str | None,
+) -> str:
+    """Render the reviewer prompt and its machine-checked output contract."""
+    inputs = [f"Artifact: {artifact.resolve()}"]
+    if diff_path is not None:
+        inputs.append(f"Code diff snapshot: {diff_path.resolve()}")
+    if snapshot_provenance is not None:
+        inputs.append(f"Snapshot provenance: {snapshot_provenance}")
+    prior = (
+        "No prior disposition memo."
+        if memo is None
+        else f"Prior disposition memo:\n{memo}"
+    )
+    return f"""Review phase: {phase}
+Round: {round_number} of 3
+{chr(10).join(inputs)}
+
+Read the supplied artifact and review it rigorously. In later rounds, verify the
+prior dispositions and changes rather than repeating resolved findings. Do not
+edit files or run commands that write to the repository.
+
+{prior}
+
+Output only findings in this exact repeated format:
+
+### Finding N: concise label
+**Class:** PREMISE | QUALITY
+**Severity:** BLOCKER | IMPROVE | NIT
+
+Concrete explanation and required action.
+
+Use one accepted class and severity value exactly. Keep a finding's number when
+it persists into a later round, never reuse a withdrawn number, and assign new
+findings numbers above every number used earlier. If there are no findings,
+output exactly: No findings.
+"""
+
+
+def _base_root() -> Path:
+    configured = os.environ.get("AGENT_REVIEW_ROOT")
+    if configured is not None:
+        return Path(configured).expanduser().resolve()
+    state_home = os.environ.get("XDG_STATE_HOME")
+    if state_home is None:
+        state_home = str(Path.home() / ".local" / "state")
+    return (Path(state_home).expanduser() / "utac-agent-review").resolve()
+
+
+def _root(reviewer: Reviewer) -> Path:
+    return _base_root() / reviewer
+
+
+def _state_path(root: Path, session: str) -> Path:
+    return root / session / "state.json"
+
+
+def _save_state(root: Path, state: ReviewState) -> None:
+    path = _state_path(root, state.session)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(asdict(state), indent=2) + "\n")
+    temporary.replace(path)
+
+
+def _load_state(root: Path, reviewer: Reviewer, session: str | None) -> ReviewState:
+    if session is None:
+        active = root / ".active"
+        if not active.exists():
+            raise ReviewError(f"no active {reviewer} review session")
+        session = active.read_text().strip()
+    if not session or sanitize_name(session) != session:
+        raise ReviewError(
+            "invalid session name; use letters, digits, '.', '_', or '-'"
+        )
+    path = _state_path(root, session)
+    if not path.exists():
+        raise ReviewError(f"{reviewer} review session not found: {session}")
+    raw = cast(dict[str, object], json.loads(path.read_text()))
+    stored_reviewer = cast(Reviewer, raw["reviewer"])
+    if stored_reviewer != reviewer:
+        raise ReviewError(
+            f"review session {session} belongs to {stored_reviewer}, not {reviewer}"
+        )
+    return ReviewState(
+        reviewer=stored_reviewer,
+        session=cast(str, raw["session"]),
+        repo=cast(str, raw["repo"]),
+        phase=cast(Phase, raw["phase"]),
+        artifact=cast(str, raw["artifact"]),
+        round=cast(int, raw["round"]),
+        statuses=cast(dict[str, str], raw["statuses"]),
+        finding_numbers=tuple(cast(list[int], raw.get("finding_numbers", []))),
+        blocked=cast(bool, raw.get("blocked", False)),
+        response=cast(str | None, raw.get("response")),
+        merge_base=cast(str | None, raw.get("merge_base")),
+        base_ref=cast(str | None, raw.get("base_ref")),
+        last_dispositioned_round=cast(
+            int | None,
+            raw.get("last_dispositioned_round"),
+        ),
+    )
+
+
+def _review_command(reviewer: Reviewer) -> list[str]:
+    reviewer_variable = f"{reviewer.upper()}_REVIEW_ASK_JSON"
+    encoded = os.environ.get(
+        reviewer_variable,
+        os.environ.get("AGENT_REVIEW_ASK_JSON"),
+    )
+    if encoded is not None:
+        value = cast(object, json.loads(encoded))
+        if not isinstance(value, list) or not value or not all(
+            isinstance(item, str) for item in cast(list[object], value)
+        ):
+            raise ReviewError(
+                f"{reviewer_variable} must encode a non-empty string list"
+            )
+        return cast(list[str], value)
+    name = f"{reviewer}-ask.cmd" if os.name == "nt" else f"{reviewer}-ask"
+    resolved = shutil.which(name)
+    if resolved is None:
+        raise ReviewError(
+            f"missing required command: {name}; run ./setup, open a new shell, "
+            "and retry"
+        )
+    return [resolved]
+
+
+def _truncate_tracked_diff(diff: str) -> str:
+    encoded = diff.encode()
+    if len(encoded) <= MAX_TRACKED_DIFF_BYTES:
+        return diff
+    prefix = encoded[:MAX_TRACKED_DIFF_BYTES].decode(errors="replace")
+    omitted = len(encoded) - MAX_TRACKED_DIFF_BYTES
+    return f"{prefix}\n[tracked diff truncated: {omitted} bytes omitted]"
+
+
+def _read_untracked(path: Path, byte_limit: int) -> tuple[str, int]:
+    if byte_limit <= 0:
+        return "[omitted: untracked snapshot byte budget exhausted]", 0
+    limit = min(MAX_UNTRACKED_FILE_BYTES, byte_limit)
+    try:
+        mode = path.lstat().st_mode
+        if stat.S_ISLNK(mode):
+            return "[symlink omitted]", 0
+        if not stat.S_ISREG(mode):
+            return "[non-regular file omitted]", 0
+        with path.open("rb") as stream:
+            data = stream.read(limit + 1)
+    except OSError as error:
+        detail = error.strerror or type(error).__name__
+        return f"[unreadable: {detail}]", 0
+    truncated = len(data) > limit
+    data = data[:limit]
+    try:
+        content = data.decode()
+    except UnicodeDecodeError:
+        return "[binary file omitted]", len(data)
+    if truncated:
+        content += f"\n[truncated after {limit} bytes]"
+    return content, len(data)
+
+
+def _refresh_code_snapshot(
+    root: Path, state: ReviewState
+) -> tuple[ReviewState, Path, str]:
+    repo = Path(state.repo)
+    if state.merge_base is None:
+        selection = _snapshot_base(repo, state.base_ref)
+    else:
+        selection = SnapshotBase(
+            sha=state.merge_base,
+            reference=state.base_ref or "recorded feature merge base",
+            branch=_git(repo, "branch", "--show-current") or "HEAD",
+            head=_git(repo, "rev-parse", "HEAD"),
+        )
+    tracked = _git(repo, "diff", selection.sha, "--")
+    untracked = _git(
+        repo,
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "-z",
+    )
+    relative_paths = [item for item in untracked.split("\0") if item]
+    if not tracked and not relative_paths:
+        raise ReviewError(
+            f"code snapshot contains no changes relative to {selection.reference}; "
+            "choose the reviewed change's base with --base REF"
+        )
+    phase_dir = root / state.session / state.phase
+    phase_dir.mkdir(parents=True, exist_ok=True)
+    diff_path = phase_dir / "diff.patch"
+    provenance_lines = (
+        f"# branch {selection.branch}",
+        f"# HEAD {selection.head}",
+        f"# base {selection.sha} ({selection.reference})",
+    )
+    parts = [*provenance_lines, _truncate_tracked_diff(tracked)]
+    remaining = MAX_UNTRACKED_TOTAL_BYTES
+    for relative in relative_paths:
+        path = repo / relative
+        content, consumed = _read_untracked(path, remaining)
+        remaining -= consumed
+        parts.append(f"# Untracked file: {relative}\n{content}")
+    diff_path.write_text("\n\n".join(parts).rstrip() + "\n")
+    provenance = "; ".join(line.removeprefix("# ") for line in provenance_lines)
+    return (
+        replace(
+            state,
+            merge_base=selection.sha,
+            base_ref=selection.reference,
+        ),
+        diff_path,
+        provenance,
+    )
+
+
+def _run_ask(state: ReviewState, prompt: Path, output: Path) -> str | None:
+    command = [
+        *_review_command(state.reviewer),
+        str(prompt),
+        "--session",
+        state.session,
+        "--read-only",
+        "--output",
+        str(output),
+    ]
+    # A failed retry must not reinterpret an earlier attempt's response as new.
+    output.unlink(missing_ok=True)
+    completed = subprocess.run(
+        command,
+        cwd=state.repo,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        detail = (
+            completed.stderr.strip()
+            or completed.stdout.strip()
+            or f"exited with status {completed.returncode}"
+        )
+        if (
+            RESPONSE_COMPLETE_MARKER in completed.stderr
+            and output.is_file()
+            and output.read_text().strip()
+        ):
+            return (
+                "review completed but its session was not registered; "
+                f"response preserved at {output}; this round is complete -- "
+                "proceed with continue, advance, or finish; "
+                f"bridge detail: {detail}"
+            )
+        raise ReviewError(f"{state.reviewer}-ask failed: {detail}")
+    if not output.is_file() or not output.read_text().strip():
+        raise ReviewError(f"{state.reviewer}-ask produced no review response")
+    return None
+
+
+def _invoke_round(
+    root: Path,
+    state: ReviewState,
+    memo: str | None = None,
+    prepared_snapshot: tuple[ReviewState, Path, str] | None = None,
+) -> ReviewState:
+    phase_dir = root / state.session / state.phase
+    phase_dir.mkdir(parents=True, exist_ok=True)
+    diff_path: Path | None = None
+    snapshot_provenance: str | None = None
+    if state.phase == "code":
+        if prepared_snapshot is None:
+            prepared_snapshot = _refresh_code_snapshot(root, state)
+        state, diff_path, snapshot_provenance = prepared_snapshot
+        # Freeze the resolved base before an external call can fail or HEAD can move.
+        _save_state(root, state)
+    prompt = phase_dir / f"round{state.round}.prompt.md"
+    response = phase_dir / f"round{state.round}.response.md"
+    prompt.write_text(
+        render_round_prompt(
+            state.phase,
+            Path(state.artifact),
+            state.round,
+            memo,
+            diff_path,
+            snapshot_provenance,
+        )
+    )
+    bridge_warning = _run_ask(state, prompt, response)
+    try:
+        findings = parse_findings(response.read_text())
+    except ReviewError:
+        repair_prompt = phase_dir / f"round{state.round}-repair.prompt.md"
+        repair_response = phase_dir / f"round{state.round}-repair.response.md"
+        repair_prompt.write_text(
+            "Reformat the previous response into the exact finding contract in "
+            f"{prompt}. Preserve its substance and output no extra prose.\n\n"
+            f"Previous response:\n{response.read_text()}"
+        )
+        repair_warning = _run_ask(state, repair_prompt, repair_response)
+        bridge_warning = bridge_warning or repair_warning
+        try:
+            findings = parse_findings(repair_response.read_text())
+        except ReviewError as error:
+            raise ReviewError(
+                "review response format is invalid after one repair attempt; "
+                "expected repeated Finding/Class/Severity blocks or exactly "
+                "'No findings.'"
+            ) from error
+        response = repair_response
+    premise_blocked = any(
+        finding.classification == "PREMISE" and finding.severity == "BLOCKER"
+        for finding in findings
+    )
+    validate_monotonic_findings(findings, state.finding_numbers)
+    all_numbers = tuple(
+        sorted({*state.finding_numbers, *(finding.number for finding in findings)})
+    )
+    state = replace(
+        state,
+        finding_numbers=all_numbers,
+        blocked=premise_blocked,
+        response=str(response),
+    )
+    _save_state(root, state)
+    if bridge_warning is not None:
+        raise ReviewError(bridge_warning)
+    return state
+
+
+def _branch(repo: Path) -> str:
+    return _git(repo, "branch", "--show-current", check=False) or "HEAD"
+
+
+def _start(args: argparse.Namespace) -> None:
+    reviewer = cast(Reviewer, args.reviewer)
+    root = _root(reviewer)
+    artifact = Path(cast(str, args.artifact)).resolve()
+    if not artifact.is_file():
+        raise ReviewError(f"artifact is not a file: {artifact}")
+    # Diagnose an unavailable bridge before touching repository state.
+    _review_command(reviewer)
+    repo = Path.cwd().resolve()
+    phase = cast(Phase, args.phase)
+    base_ref = cast(str | None, args.base)
+    if base_ref is not None and phase != "code":
+        raise ReviewError("--base is valid only for the code phase")
+    session = derive_session_name(
+        explicit=cast(str | None, args.session),
+        branch=_branch(repo),
+        artifact=artifact,
+        cwd_name=repo.name,
+        today=datetime.now(tz=UTC).astimezone().date(),
+        reviews_root=root,
+    )
+    if (root / session).exists():
+        raise ReviewError(f"{reviewer} review session already exists: {session}")
+    statuses = {item: "not-started" for item in PHASES}
+    statuses[phase] = "active"
+    state = ReviewState(
+        reviewer=reviewer,
+        session=session,
+        repo=str(repo),
+        phase=phase,
+        artifact=str(artifact),
+        round=1,
+        statuses=statuses,
+        base_ref=base_ref,
+    )
+    prepared_snapshot: tuple[ReviewState, Path, str] | None = None
+    if phase == "code":
+        prepared_snapshot = _refresh_code_snapshot(root, state)
+        state = prepared_snapshot[0]
+    root.mkdir(parents=True, exist_ok=True)
+    (root / ".active").write_text(session + "\n")
+    _save_state(root, state)
+    state = _invoke_round(root, state, prepared_snapshot=prepared_snapshot)
+    print(f"{reviewer}/{state.session}: {state.phase} round 1 -> {state.response}")
+
+
+def _continue(args: argparse.Namespace) -> None:
+    reviewer = cast(Reviewer, args.reviewer)
+    root = _root(reviewer)
+    state = _load_state(root, reviewer, cast(str | None, args.session))
+    if state.round >= 3:
+        raise ReviewError("review phase is limited to three rounds")
+    if state.response is None:
+        raise ReviewError("current round has no response")
+    findings = parse_findings(Path(state.response).read_text())
+    override = cast(str | None, args.override_premise)
+    require_premise_override(findings, override)
+    memo_path = Path(cast(str, args.memo)).resolve()
+    if not memo_path.is_file():
+        raise ReviewError(f"disposition memo is not a file: {memo_path}")
+    memo = memo_path.read_text()
+    validate_memo(
+        memo,
+        findings,
+        premise_override=bool(override and override.strip()),
+    )
+    phase_dir = root / state.session / state.phase
+    (phase_dir / f"round{state.round}.memo.md").write_text(memo)
+    if override:
+        (phase_dir / f"round{state.round}.premise-override.txt").write_text(
+            override.strip() + "\n"
+        )
+    state = replace(
+        state,
+        round=state.round + 1,
+        blocked=False,
+        response=None,
+        last_dispositioned_round=state.round,
+    )
+    _save_state(root, state)
+    state = _invoke_round(root, state, memo)
+    print(
+        f"{reviewer}/{state.session}: {state.phase} round {state.round} "
+        f"-> {state.response}"
+    )
+
+
+def _status(args: argparse.Namespace) -> None:
+    reviewer = cast(Reviewer, args.reviewer)
+    state = _load_state(
+        _root(reviewer),
+        reviewer,
+        cast(str | None, args.session),
+    )
+    print(json.dumps(asdict(state), indent=2))
+
+
+def _retry(args: argparse.Namespace) -> None:
+    reviewer = cast(Reviewer, args.reviewer)
+    root = _root(reviewer)
+    state = _load_state(root, reviewer, cast(str | None, args.session))
+    if state.response is not None:
+        raise ReviewError(
+            "current round already has a response; use continue, advance, or finish"
+        )
+    memo: str | None = None
+    if state.round > 1:
+        memo_name = f"round{state.round - 1}.memo.md"
+        memo_path = root / state.session / state.phase / memo_name
+        if not memo_path.is_file():
+            raise ReviewError(
+                f"cannot retry without prior disposition memo: {memo_path}"
+            )
+        memo = memo_path.read_text()
+    state = _invoke_round(root, state, memo)
+    print(
+        f"{reviewer}/{state.session}: {state.phase} round {state.round} "
+        f"-> {state.response}"
+    )
+
+
+def _close_current_round(
+    root: Path,
+    state: ReviewState,
+    memo_value: str | None,
+    override: str | None,
+    *,
+    context: str,
+) -> ReviewState:
+    if state.response is None:
+        raise ReviewError("current round has no response; retry it before close")
+    findings = parse_findings(Path(state.response).read_text())
+    if not findings:
+        return replace(
+            state,
+            blocked=False,
+            last_dispositioned_round=state.round,
+        )
+    if state.last_dispositioned_round == state.round:
+        return state
+    numbers = [finding.number for finding in findings]
+    if memo_value is None:
+        raise ReviewError(f"{context} has undispositioned findings: {numbers}")
+    memo_path = Path(memo_value).resolve()
+    if not memo_path.is_file():
+        raise ReviewError(f"disposition memo is not a file: {memo_path}")
+    memo = memo_path.read_text()
+    require_premise_override(findings, override)
+    validate_closing_memo(
+        memo,
+        findings,
+        premise_override=bool(override and override.strip()),
+    )
+    phase_dir = root / state.session / state.phase
+    (phase_dir / f"round{state.round}.memo.md").write_text(memo)
+    if override:
+        (phase_dir / f"round{state.round}.premise-override.txt").write_text(
+            override.strip() + "\n"
+        )
+    return replace(
+        state,
+        blocked=False,
+        last_dispositioned_round=state.round,
+    )
+
+
+def _advance(args: argparse.Namespace) -> None:
+    reviewer = cast(Reviewer, args.reviewer)
+    root = _root(reviewer)
+    state = _load_state(root, reviewer, cast(str | None, args.session))
+    phase = cast(Phase, args.phase)
+    validate_phase_transition(state.phase, phase)
+    artifact = Path(cast(str, args.artifact)).resolve()
+    if not artifact.is_file():
+        raise ReviewError(f"artifact is not a file: {artifact}")
+    base_ref = cast(str | None, args.base)
+    if base_ref is not None and phase != "code":
+        raise ReviewError("--base is valid only for the code phase")
+    state = _close_current_round(
+        root,
+        state,
+        cast(str | None, args.memo),
+        cast(str | None, args.override_premise),
+        context="current phase",
+    )
+    statuses = dict(state.statuses)
+    statuses[state.phase] = "complete"
+    statuses[phase] = "active"
+    state = replace(
+        state,
+        phase=phase,
+        artifact=str(artifact),
+        round=1,
+        statuses=statuses,
+        finding_numbers=(),
+        blocked=False,
+        response=None,
+        merge_base=None,
+        base_ref=base_ref,
+        last_dispositioned_round=None,
+    )
+    prepared_snapshot: tuple[ReviewState, Path, str] | None = None
+    if phase == "code":
+        prepared_snapshot = _refresh_code_snapshot(root, state)
+        state = prepared_snapshot[0]
+    _save_state(root, state)
+    state = _invoke_round(root, state, prepared_snapshot=prepared_snapshot)
+    print(f"{reviewer}/{state.session}: {state.phase} round 1 -> {state.response}")
+
+
+def _finish(args: argparse.Namespace) -> None:
+    reviewer = cast(Reviewer, args.reviewer)
+    root = _root(reviewer)
+    state = _load_state(root, reviewer, cast(str | None, args.session))
+    state = _close_current_round(
+        root,
+        state,
+        cast(str | None, args.memo),
+        cast(str | None, args.override_premise),
+        context="final round",
+    )
+    statuses = dict(state.statuses)
+    statuses[state.phase] = "complete"
+    state = replace(state, statuses=statuses)
+    _save_state(root, state)
+    active = root / ".active"
+    if active.exists() and active.read_text().strip() == state.session:
+        active.unlink()
+    print(f"{reviewer}/{state.session}: complete")
+
+
+def _parser() -> argparse.ArgumentParser:
+    program = os.environ.get("AGENT_REVIEW_PROG", "agent-review")
+    default_reviewer = os.environ.get("AGENT_REVIEW_DEFAULT_REVIEWER")
+    parser = argparse.ArgumentParser(prog=program, description=__doc__)
+    parser.add_argument("--version", action="version", version="agent-review 1.0")
+    if default_reviewer is None:
+        parser.add_argument("--reviewer", choices=REVIEWERS, required=True)
+    elif default_reviewer in REVIEWERS:
+        parser.set_defaults(reviewer=default_reviewer)
+    else:
+        raise ReviewError(
+            "AGENT_REVIEW_DEFAULT_REVIEWER must be 'codex' or 'claude'"
+        )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    start = subparsers.add_parser("start", help="start a review and run round one")
+    start.add_argument("--phase", choices=PHASES, required=True)
+    start.add_argument("--artifact", required=True)
+    start.add_argument("--base")
+    start.add_argument("--session")
+    start.set_defaults(handler=_start)
+
+    continuation = subparsers.add_parser("continue", help="submit dispositions")
+    continuation.add_argument("--memo", required=True)
+    continuation.add_argument("--override-premise")
+    continuation.add_argument("--session")
+    continuation.set_defaults(handler=_continue)
+
+    status = subparsers.add_parser("status", help="show review state")
+    status.add_argument("--session")
+    status.set_defaults(handler=_status)
+
+    retry = subparsers.add_parser("retry", help="retry a failed current round")
+    retry.add_argument("--session")
+    retry.set_defaults(handler=_retry)
+
+    advance = subparsers.add_parser("advance", help="start the next review phase")
+    advance.add_argument("--phase", choices=PHASES, required=True)
+    advance.add_argument("--artifact", required=True)
+    advance.add_argument("--base")
+    advance.add_argument("--memo")
+    advance.add_argument("--override-premise")
+    advance.add_argument("--session")
+    advance.set_defaults(handler=_advance)
+
+    finish = subparsers.add_parser("finish", help="complete the review")
+    finish.add_argument("--memo")
+    finish.add_argument("--override-premise")
+    finish.add_argument("--session")
+    finish.set_defaults(handler=_finish)
+    return parser
+
+
+def main() -> int:
+    try:
+        args = _parser().parse_args()
+        handler = cast(object, args.handler)
+        if not callable(handler):
+            raise ReviewError("invalid command handler")
+        handler(args)
+    except (OSError, ReviewError, json.JSONDecodeError) as error:
+        print(f"agent-review: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

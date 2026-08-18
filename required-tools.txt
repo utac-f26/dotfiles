@@ -1,0 +1,28 @@
+# Commands that a passing setup receipt must inventory.
+#
+# This is the single versioned tool-contract source for the student self-check
+# and trusted offline receipt validator. Each line is the first receipt schema
+# that requires the command, followed by the command. Never raise an existing
+# line's version: add a new requirement under a new receipt schema instead.
+4 git
+4 ssh
+4 node
+4 npm
+4 npx
+4 uv
+4 gh
+4 rg
+4 fd
+4 fzf
+4 jq
+4 age
+4 age-keygen
+4 sops
+4 ruff
+4 pyright
+4 codex
+4 remote-run
+4 with-secrets
+5 agent-review
+5 codex-review
+5 claude-review
