@@ -1,8 +1,8 @@
-# Sign in to Codex with UT ChatGPT EDU
+# Sign in to Codex with your UT ChatGPT account
 
 Codex is OpenAI's coding agent, and `codex` is the CLI command used in this
-course. ChatGPT is the account and workspace you use to sign in. UT ChatGPT EDU
-Campus is available to every student.
+course. ChatGPT is the account and workspace you use to sign in. UT provides
+ChatGPT Edu to every student at no cost.
 
 1. Go to `https://chatgpt.com/`.
 2. Sign in with `yourEID@eid.utexas.edu`.

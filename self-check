@@ -178,7 +178,7 @@ check_claude_auth() {
             "Claude Code signed in with a Claude account"
     else
         add_check "claude_auth" false \
-            "run claude auth login with your UT Claude EDU account"
+            "run claude auth login with your UT Claude account"
     fi
 }
 

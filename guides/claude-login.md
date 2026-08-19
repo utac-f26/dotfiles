@@ -1,8 +1,8 @@
-# Sign in to Claude Code with UT Claude EDU
+# Sign in to Claude Code with your UT Claude account
 
 Claude Code is Anthropic's coding agent, and `claude` is the CLI command used
 in this course. claude.ai is the account and workspace you use to sign in. UT
-Claude EDU is centrally funded and available to every student.
+provides Claude access to every student at no cost.
 
 1. Go to `https://claude.ai/`.
 2. Sign in with `yourEID@eid.utexas.edu`.

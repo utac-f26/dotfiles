@@ -25,7 +25,7 @@ requirement.
 4. Follow `guides/codex-login.md` and make sure `codex login status` reports a
    logged-in UT Austin ChatGPT account.
 5. Follow `guides/claude-login.md` and make sure `claude auth status` reports
-   a signed-in UT Claude EDU account.
+   a signed-in UT Claude account.
 6. Run `./self-check` on the laptop or department home you want to certify.
 7. Commit and push `.setup-receipt.json`.
 8. Put the agent to work: run `codex` in `~/dotfiles` and ask it to add a
@@ -54,8 +54,9 @@ announcement will say whether you also need `./links`, `./setup --update`, or a
 manual Codex seed merge. Your commits remain ordinary student history; course
 updates do not overwrite them.
 
-The self-check requires Codex and Claude Code because the UT ChatGPT EDU and
-UT Claude EDU paths are available to every student. It does not require Gemini.
+The self-check requires Codex and Claude Code because UT provides both —
+ChatGPT Edu and university-managed Claude access — to every student. It does
+not require Gemini.
 
 ## Grading
 

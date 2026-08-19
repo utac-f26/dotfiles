@@ -130,7 +130,7 @@ before starting the new task.
 The course uses two coding agents, and both accounts are university-provided.
 Codex's CLI command is `codex`; sign in with your UT ChatGPT account as
 described in `guides/codex-login.md`. Claude Code's CLI command is `claude`;
-sign in with your UT Claude EDU account as described in
+sign in with your UT Claude account as described in
 `guides/claude-login.md`. Then check both:
 
 ```bash
@@ -179,10 +179,9 @@ the lifecycle); a `No findings.` response needs none. A QUALITY BLOCKER must
 be under Addressing. A human-overridden PREMISE BLOCKER belongs under Pushing
 back, and the driver records the override reason beside the memo.
 
-Codex review works with the required UT Codex login. Claude review is optional
-because Claude Code requires a separate account. If it is unavailable, the
-command says which login or executable is missing instead of falling back to a
-self-review.
+Codex review and Claude review both work with the required UT logins. If a
+login or executable is missing, the command says which one instead of falling
+back to a self-review.
 
 ## Department Linux hosts
 
