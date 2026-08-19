@@ -17,9 +17,14 @@ Dummy round-trip:
 
 ```bash
 printf 'EXAMPLE_SECRET=hello\n' > /tmp/example.env
-sops -e --input-type dotenv --output-type dotenv /tmp/example.env > secrets/example.env
+sops -e --filename-override secrets/example.env \
+    --input-type dotenv --output-type dotenv /tmp/example.env > secrets/example.env
 with-secrets secrets/example.env -- sh -c 'test "$EXAMPLE_SECRET" = hello'
 ```
+
+`--filename-override` is required: sops matches `.sops.yaml` creation rules
+against the input path, and `/tmp/example.env` matches no rule. The override
+applies the `secrets/*.env` rule without ever writing plaintext inside the repo.
 
 `with-secrets` delegates environment injection to `sops exec-env`. Decrypted
 values exist only in process memory; the wrapper does not create a plaintext
