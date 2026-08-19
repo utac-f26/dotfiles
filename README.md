@@ -125,22 +125,20 @@ Quick Chat, not a new Codex task. Because nothing else carries over, the same
 handoff discipline applies: put status, next actions, and gotchas into the repo
 before starting the new task.
 
-## Codex sign-in
+## Agent sign-in
 
-Codex is the coding agent and `codex` is its CLI command. Sign in with your UT
-ChatGPT account as described in `guides/codex-login.md`, then check:
+The course uses two coding agents, and both accounts are university-provided.
+Codex's CLI command is `codex`; sign in with your UT ChatGPT account as
+described in `guides/codex-login.md`. Claude Code's CLI command is `claude`;
+sign in with your UT Claude EDU account as described in
+`guides/claude-login.md`. Then check both:
 
 ```bash
 codex login status
+claude auth status
 ```
 
-Claude Code and Gemini are useful, but this homework does not require them.
-Claude Code requires your own Claude Pro subscription. Gemini is optional and
-uses `secrets/gemini.env` if you choose to set it up.
-
-The repository still includes the full Claude command, skill, handoff,
-breadcrumb, and cross-model-review material so that it is ready if you use
-Claude later. Optional login does not mean partial configuration.
+Gemini is optional and uses `secrets/gemini.env` if you choose to set it up.
 
 ## Cross-model review
 

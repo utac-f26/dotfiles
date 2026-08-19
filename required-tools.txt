@@ -26,3 +26,4 @@
 5 agent-review
 5 codex-review
 5 claude-review
+6 claude

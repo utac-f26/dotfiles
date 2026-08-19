@@ -3,7 +3,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 RECEIPT="${REPO_ROOT}/.setup-receipt.json"
-VERSION=5
+VERSION=6
 REQUIRED_TOOLS="${REPO_ROOT}/required-tools.txt"
 UPSTREAM_URL="$(tr -d '[:space:]' <"${REPO_ROOT}/upstream-url")"
 TMP_DIR="$(mktemp -d)"
@@ -167,6 +167,21 @@ check_codex_auth() {
     fi
 }
 
+check_claude_auth() {
+    # `claude auth status` exits 0 whether or not anyone is signed in; the
+    # JSON loggedIn field is the actual answer. Written to a file, not piped:
+    # a jq that exits early would SIGPIPE the writer under pipefail.
+    local status_json="${TMP_DIR}/claude-auth.json"
+    if claude auth status >"$status_json" 2>/dev/null \
+        && jq -e '.loggedIn == true' "$status_json" >/dev/null 2>&1; then
+        add_check "claude_auth" true \
+            "Claude Code signed in with a Claude account"
+    else
+        add_check "claude_auth" false \
+            "run claude auth login with your UT Claude EDU account"
+    fi
+}
+
 check_age_key() {
     local key_file="${HOME}/.config/sops/age/keys.txt"
     local marker="AGE-SECRET-""KEY-"
@@ -292,6 +307,7 @@ main() {
     check_core_tools
     check_github_auth
     check_codex_auth
+    check_claude_auth
     check_age_key
     check_secrets_roundtrip
     check_plaintext_leaks
