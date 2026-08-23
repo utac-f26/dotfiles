@@ -194,9 +194,11 @@ check_age_key() {
 
 check_secrets_roundtrip() {
     local plain enc key_file recipient
-    plain="${TMP_DIR}/example.env"
+    # Place the plaintext fixture under secrets/ so it matches .sops.yaml.
+    plain="${TMP_DIR}/secrets/example.env"
     enc="${TMP_DIR}/example.sops.env"
     key_file="${HOME}/.config/sops/age/keys.txt"
+    mkdir -p "$(dirname "$plain")"
     printf 'EXAMPLE_SECRET=hello\n' >"$plain"
     recipient="$(age-keygen -y "$key_file" | tail -n 1 2>/dev/null || true)"
     if [[ -z "$recipient" ]]; then
