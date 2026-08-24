@@ -175,12 +175,20 @@ download_asset() {
 }
 
 # Isolate temporary-file cleanup so traps cannot leak into caller functions.
+trap_cleanup_dir() {
+    local dir="$1"
+    local cleanup
+    printf -v cleanup 'rm -rf -- %q' "$dir"
+    # shellcheck disable=SC2064 # Embed the path before the local goes away.
+    trap "$cleanup" EXIT
+}
+
 install_tar_binaries() (
     local url="$1"
     shift
     local tmp archive bin found
     tmp="$(mktemp -d)"
-    trap 'rm -rf -- "$tmp"' EXIT
+    trap_cleanup_dir "$tmp"
     archive="$tmp/asset"
     log "downloading ${url##*/}"
     download_asset "$url" "$archive"
@@ -199,7 +207,7 @@ install_single_binary() (
     local name="$2"
     local tmp
     tmp="$(mktemp -d)"
-    trap 'rm -rf -- "$tmp"' EXIT
+    trap_cleanup_dir "$tmp"
     log "downloading ${url##*/}"
     download_asset "$url" "$tmp/$name"
     install -m 0755 "$tmp/$name" "$LOCAL_BIN/$name"
@@ -228,7 +236,7 @@ install_node() (
     node_platform="${os}-${node_arch}"
     url="https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-${node_platform}.tar.xz"
     tmp="$(mktemp -d)"
-    trap 'rm -rf -- "$tmp"' EXIT
+    trap_cleanup_dir "$tmp"
     archive="$tmp/node.tar.xz"
     dest="${HOME}/.local/node-${NODE_VERSION}-${node_platform}"
     log "installing Node.js $NODE_VERSION"
