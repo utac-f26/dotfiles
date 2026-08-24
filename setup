@@ -5,9 +5,11 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 LOCAL_BIN="${HOME}/.local/bin"
 UPSTREAM_URL="$(tr -d '[:space:]' <"${REPO_ROOT}/upstream-url")"
 ASSET_CHECKSUMS="${REPO_ROOT}/asset-checksums.txt"
+TOOL_VERSIONS="${REPO_ROOT}/tool-versions.txt"
+# shellcheck disable=SC1091 # REPO_ROOT is resolved before sourcing.
+source "${REPO_ROOT}/lib/tool-versions.sh"
 NODE_VERSION="v22.17.1"
 NODE_MIN_MAJOR=22
-UV_VERSION="0.12.3"
 UPDATE=0
 SKIP_INSTALL="${DOTFILES_SKIP_INSTALL:-0}"
 MIN_FREE_MB="${DOTFILES_MIN_FREE_MB:-2000}"
@@ -18,22 +20,27 @@ MIN_FREE_MB="${DOTFILES_MIN_FREE_MB:-2000}"
 # (60 requests/hour per IP). Pins also keep the cohort on identical
 # binaries. fd stays at 10.3.0: later releases dropped the
 # x86_64-apple-darwin asset that Intel-Mac students need.
-GH_VERSION=2.97.0
-RG_VERSION=15.2.0
-FD_VERSION=10.3.0
-FZF_VERSION=0.74.2
-AGE_VERSION=1.3.1
-SOPS_VERSION=3.13.3
-JQ_VERSION=1.8.2
+UV_VERSION="$(utac_pinned_version "$TOOL_VERSIONS" uv)"
+GH_VERSION="$(utac_pinned_version "$TOOL_VERSIONS" gh)"
+RG_VERSION="$(utac_pinned_version "$TOOL_VERSIONS" rg)"
+FD_VERSION="$(utac_pinned_version "$TOOL_VERSIONS" fd)"
+FZF_VERSION="$(utac_pinned_version "$TOOL_VERSIONS" fzf)"
+AGE_VERSION="$(utac_pinned_version "$TOOL_VERSIONS" age)"
+SOPS_VERSION="$(utac_pinned_version "$TOOL_VERSIONS" sops)"
+JQ_VERSION="$(utac_pinned_version "$TOOL_VERSIONS" jq)"
+RUFF_VERSION="$(utac_pinned_version "$TOOL_VERSIONS" ruff)"
+PYRIGHT_VERSION="$(utac_pinned_version "$TOOL_VERSIONS" pyright)"
+CLAUDE_VERSION="$(utac_pinned_version "$TOOL_VERSIONS" claude)"
+CODEX_VERSION="$(utac_pinned_version "$TOOL_VERSIONS" codex)"
 
 usage() {
     cat <<'EOF'
 usage: ./setup [--update]
 
 Installs the course toolchain without root, creates the SOPS age key if needed,
-and links the student-owned Claude/Codex config files. Tool versions are
-pinned at the top of this script; --update reinstalls the pinned versions
-(bump the pins first to move forward).
+and links the student-owned Claude/Codex config files. Managed tool versions are
+pinned in tool-versions.txt; --update reinstalls those versions (bump the
+contract and asset checksums first to move forward).
 EOF
 }
 
@@ -61,9 +68,31 @@ have() {
     command -v "$1" >/dev/null 2>&1
 }
 
+github_remote_identity() {
+    printf '%s\n' "$1" \
+        | LC_ALL=C tr '[:upper:]' '[:lower:]' \
+        | sed -E \
+            -e 's#^https?://([^/@]+@)?github.com/##' \
+            -e 's#^ssh://([^/@]+@)?github.com/##' \
+            -e 's#^[^/@]+@github.com:##' \
+            -e 's#^git://github.com/##' \
+            -e 's#\.git/?$##' \
+            -e 's#/$##'
+}
+
+tool_is_compatible() {
+    local tool="$1"
+    local minimum="$2"
+    local output
+    have "$tool" || return 1
+    output="$("$tool" --version 2>&1 | head -n 1)" || return 1
+    utac_version_is_compatible "$output" "$minimum"
+}
+
 should_install() {
     local tool="$1"
-    [[ "$UPDATE" == 1 ]] || ! have "$tool"
+    local minimum="$2"
+    [[ "$UPDATE" == 1 ]] || ! tool_is_compatible "$tool" "$minimum"
 }
 
 node_is_compatible() {
@@ -120,7 +149,7 @@ ensure_path() {
 }
 
 configure_git_updates() {
-    local branch existing
+    local branch existing origin origin_id origin_push origin_push_id upstream_id
     branch="$(git -C "$REPO_ROOT" branch --show-current)"
     [[ "$branch" == main ]] || die \
         "dotfiles checkout must be on main, not ${branch:-a detached HEAD}"
@@ -131,15 +160,30 @@ configure_git_updates() {
         git -C "$REPO_ROOT" remote add upstream "$UPSTREAM_URL"
         log "added course update remote: $UPSTREAM_URL"
     fi
-    git -C "$REPO_ROOT" remote get-url origin >/dev/null 2>&1 || die \
+    origin="$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null)" || die \
         "missing personal 'origin' remote; clone your seeded repository first"
+    origin_id="$(github_remote_identity "$origin")"
+    upstream_id="$(github_remote_identity "$UPSTREAM_URL")"
+    [[ "$origin_id" != "$upstream_id" ]] || die \
+        "origin is the public course repository; clone your personal seeded repository"
+    # A stale pushurl overrides the fetch URL even when branch.pushRemote is
+    # correct. Reset it so the reviewed origin URL owns both directions.
+    git -C "$REPO_ROOT" config --unset-all remote.origin.pushurl 2>/dev/null || true
+    origin_push="$(git -C "$REPO_ROOT" remote get-url --push origin)"
+    origin_push_id="$(github_remote_identity "$origin_push")"
+    [[ "$origin_push_id" == "$origin_id" ]] || die \
+        "origin's effective push URL differs from its personal fetch URL"
     # `git pull` receives course updates; `git push` still submits to the
     # student's personal origin. Merge, rather than rebase, preserves the
     # common template history and exposes conflicts in student-edited files.
     git -C "$REPO_ROOT" config branch.main.remote upstream
     git -C "$REPO_ROOT" config branch.main.merge refs/heads/main
+    git -C "$REPO_ROOT" config branch.main.pushRemote origin
+    git -C "$REPO_ROOT" config branch.main.rebase false
     git -C "$REPO_ROOT" config remote.pushDefault origin
+    git -C "$REPO_ROOT" config push.default simple
     git -C "$REPO_ROOT" config pull.rebase false
+    git -C "$REPO_ROOT" config pull.ff true
 }
 
 # Department home directories are quota'd, and the toolchain (Node tree,
@@ -258,7 +302,7 @@ install_single_binary() (
 )
 
 install_uv() (
-    if ! should_install uv; then
+    if ! should_install uv "$UV_VERSION"; then
         return
     fi
     local tmp installer
@@ -325,36 +369,37 @@ install_release_tools() {
     install_uv
     install_node
 
-    if should_install gh; then
+    if should_install gh "$GH_VERSION"; then
         install_tar_binaries \
             "$(release_url cli/cli "v${GH_VERSION}" "$gh_asset")" gh
     fi
-    if should_install rg; then
+    if should_install rg "$RG_VERSION"; then
         install_tar_binaries \
             "$(release_url BurntSushi/ripgrep "${RG_VERSION}" \
                 "ripgrep-${RG_VERSION}-${rg_arch}.tar.gz")" rg
     fi
-    if should_install fd; then
+    if should_install fd "$FD_VERSION"; then
         install_tar_binaries \
             "$(release_url sharkdp/fd "v${FD_VERSION}" \
                 "fd-v${FD_VERSION}-${fd_arch}.tar.gz")" fd
     fi
-    if should_install fzf; then
+    if should_install fzf "$FZF_VERSION"; then
         install_tar_binaries \
             "$(release_url junegunn/fzf "v${FZF_VERSION}" \
                 "fzf-${FZF_VERSION}-${fzf_arch}.tar.gz")" fzf
     fi
-    if should_install age || should_install age-keygen; then
+    if should_install age "$AGE_VERSION" \
+        || should_install age-keygen "$AGE_VERSION"; then
         install_tar_binaries \
             "$(release_url FiloSottile/age "v${AGE_VERSION}" \
                 "age-v${AGE_VERSION}-${age_arch}.tar.gz")" age age-keygen
     fi
-    if should_install sops; then
+    if should_install sops "$SOPS_VERSION"; then
         install_single_binary \
             "$(release_url getsops/sops "v${SOPS_VERSION}" \
                 "sops-v${SOPS_VERSION}.${sops_arch}")" sops
     fi
-    if should_install jq; then
+    if should_install jq "$JQ_VERSION"; then
         install_single_binary \
             "$(release_url jqlang/jq "jq-${JQ_VERSION}" "jq-${jq_arch}")" jq
     fi
@@ -365,27 +410,26 @@ install_agent_tools() {
         return
     fi
     have npm || die "npm missing after Node install"
-    if should_install claude; then
+    if should_install claude "$CLAUDE_VERSION"; then
         log "installing Claude Code CLI"
         npm install --global --prefix "${HOME}/.local" \
-            "@anthropic-ai/claude-code@$(tr -d '[:space:]' \
-                <"${REPO_ROOT}/claude/pinned-version")"
+            "@anthropic-ai/claude-code@${CLAUDE_VERSION}"
     fi
-    if should_install codex; then
+    if should_install codex "$CODEX_VERSION"; then
         log "installing Codex CLI"
         npm install --global --prefix "${HOME}/.local" \
-            "@openai/codex@$(tr -d '[:space:]' <"${REPO_ROOT}/codex/pinned-version")"
+            "@openai/codex@${CODEX_VERSION}"
     fi
     have uv || die "uv missing after install"
     log "installing managed Python 3.11"
     uv python install 3.11
-    log "installing Python quality tools through uv"
-    if [[ "$UPDATE" == 1 ]]; then
-        uv tool install --force ruff
-        uv tool install --force pyright
-    else
-        uv tool install ruff || true
-        uv tool install pyright || true
+    if should_install ruff "$RUFF_VERSION"; then
+        log "installing ruff $RUFF_VERSION through uv"
+        uv tool install --force "ruff==${RUFF_VERSION}"
+    fi
+    if should_install pyright "$PYRIGHT_VERSION"; then
+        log "installing pyright $PYRIGHT_VERSION through uv"
+        uv tool install --force "pyright==${PYRIGHT_VERSION}"
     fi
 }
 

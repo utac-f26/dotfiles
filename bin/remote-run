@@ -163,14 +163,15 @@ do_clean() {
     local age_hours="$1"
     local mode="${2:-}"
     local only_status="${3:-}"
-    local dead_windows now killed=0 name dead dead_time dead_status
+    local dead_windows now killed=0 window_id dead dead_time dead_status name
 
     dead_windows=$(remote "tmux list-windows -t $SESSION \
-        -F '#{window_name} #{pane_dead} #{pane_dead_time} #{pane_dead_status}'" \
+        -F '#{window_id} #{pane_dead} #{pane_dead_time} #{pane_dead_status} #{window_name}'" \
         2>/dev/null) || return 1
     now=$(remote "date +%s")
 
-    while read -r name dead dead_time dead_status; do
+    while read -r window_id dead dead_time dead_status name; do
+        [[ "$window_id" =~ ^@[0-9]+$ ]] || continue
         [[ "$dead" == "1" ]] || continue
 
         case "$only_status" in
@@ -186,7 +187,7 @@ do_clean() {
 
         # </dev/null: ssh would otherwise consume the loop's here-string
         # stdin, ending the while-read after a single iteration.
-        if remote "tmux kill-window -t $SESSION:'$name'" \
+        if remote "tmux kill-window -t $window_id" \
                 </dev/null 2>/dev/null; then
             [[ "$mode" != "quiet" ]] && echo "Killed $name"
             killed=$((killed + 1))
@@ -243,7 +244,7 @@ case "$MODE" in
             echo "Host:    $HOST"
             echo "Session: $SESSION"
             echo "Window:  $WINDOW_NAME"
-            echo "Script:  ~/.remote-run-${WINDOW_NAME}.sh"
+            echo "Script:  ~/.remote-run-${SESSION}-${WINDOW_NAME}.XXXXXX"
             echo "--- generated script ---"
             echo '#!/usr/bin/env bash'
             # shellcheck disable=SC2016 # Print remote expansion literally.
@@ -263,32 +264,47 @@ case "$MODE" in
         # for debugging — nuke those with an explicit `remote-run --clean`.
         do_clean "" quiet 0 || true
 
-        # Check for duplicate window name. The `--` to grep keeps it from
-        # parsing dash-leading window names as flags (BSD grep on macOS
-        # rejects them outright, which silently bypassed this check and
-        # let cruft windows get created).
-        if remote "tmux list-windows -t $SESSION -F '#{window_name}'" 2>/dev/null \
-                | grep -qx -- "$WINDOW_NAME"; then
-            die "window '$WINDOW_NAME' already exists in session" \
-                "'$SESSION' on $HOST"
-        fi
-
         # Write the command to a temporary script on the remote host, then
         # have tmux run it via bash -l. This sidesteps all nested quoting
-        # issues (local shell -> ssh -> tmux -> bash). The script deletes
-        # itself after running. The pane enables remain-on-exit before user
-        # code starts, so even a millisecond command leaves its exit status.
-        SCRIPT_NAME=".remote-run-${WINDOW_NAME}.sh"
-        remote "cat > ~/$SCRIPT_NAME" <<REMOTESCRIPT
+        # issues (local shell -> ssh -> tmux -> bash). mktemp prevents jobs in
+        # different sessions from sharing a pathname. A short atomic directory
+        # lock closes the duplicate-name check/create race within one session.
+        SCRIPT_PATH="$(remote \
+            "mktemp ~/.remote-run-${SESSION}-${WINDOW_NAME}.XXXXXX")"
+        [[ "$SCRIPT_PATH" == /* \
+            && "${SCRIPT_PATH##*/}" == ".remote-run-${SESSION}-${WINDOW_NAME}."* \
+            && "$SCRIPT_PATH" != *$'\n'* ]] \
+            || die "remote mktemp returned an unsafe path"
+        printf -v QUOTED_SCRIPT '%q' "$SCRIPT_PATH"
+        remote "cat > $QUOTED_SCRIPT" <<REMOTESCRIPT
 #!/usr/bin/env bash
 tmux set-option -w -t "\$TMUX_PANE" remain-on-exit on
-rm -f ~/\$(basename "\$0")
+rm -f -- "\$0"
 export PATH="\$HOME/.local/bin:\$HOME/bin:\$PATH"
 $INNER
 REMOTESCRIPT
-        remote "chmod +x ~/$SCRIPT_NAME && \
+        set +e
+        remote "lock=\$HOME/.remote-run-${SESSION}-${WINDOW_NAME}.lock; \
+            if ! mkdir \"\$lock\" 2>/dev/null; then exit 75; fi; \
+            trap 'rmdir \"\$lock\"' EXIT; \
+            if tmux list-windows -t $SESSION -F '#{window_name}' \
+                    | grep -Fqx -- '$WINDOW_NAME'; then exit 76; fi; \
+            chmod +x $QUOTED_SCRIPT && \
             tmux new-window -t $SESSION -n '$WINDOW_NAME' \
-                'bash -l ~/$SCRIPT_NAME'"
+                'bash -l $QUOTED_SCRIPT'"
+        LAUNCH_STATUS=$?
+        set -e
+        if [[ "$LAUNCH_STATUS" -ne 0 ]]; then
+            remote "rm -f -- $QUOTED_SCRIPT" >/dev/null 2>&1 || true
+            case "$LAUNCH_STATUS" in
+                75) die "another launch is reserving window '$WINDOW_NAME' in" \
+                        "session '$SESSION' on $HOST; retry" ;;
+                76) die "window '$WINDOW_NAME' already exists in session" \
+                        "'$SESSION' on $HOST" ;;
+                *) die "could not start window '$WINDOW_NAME' in session" \
+                        "'$SESSION' on $HOST" ;;
+            esac
+        fi
 
         echo "Started on $HOST in $SESSION:$WINDOW_NAME"
         echo "  Check:  remote-run --check $HOST $WINDOW_NAME"

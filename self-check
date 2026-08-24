@@ -3,9 +3,12 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 RECEIPT="${REPO_ROOT}/.setup-receipt.json"
-VERSION=6
+VERSION=7
 REQUIRED_TOOLS="${REPO_ROOT}/required-tools.txt"
+TOOL_VERSIONS="${REPO_ROOT}/tool-versions.txt"
 UPSTREAM_URL="$(tr -d '[:space:]' <"${REPO_ROOT}/upstream-url")"
+# shellcheck disable=SC1091 # REPO_ROOT is resolved before sourcing.
+source "${REPO_ROOT}/lib/tool-versions.sh"
 TMP_DIR="$(mktemp -d)"
 CHECKS_TSV="${TMP_DIR}/checks.tsv"
 TOOLS_TSV="${TMP_DIR}/tools.tsv"
@@ -52,6 +55,18 @@ python311() {
     fi
 }
 
+github_remote_identity() {
+    printf '%s\n' "$1" \
+        | LC_ALL=C tr '[:upper:]' '[:lower:]' \
+        | sed -E \
+            -e 's#^https?://([^/@]+@)?github.com/##' \
+            -e 's#^ssh://([^/@]+@)?github.com/##' \
+            -e 's#^[^/@]+@github.com:##' \
+            -e 's#^git://github.com/##' \
+            -e 's#\.git/?$##' \
+            -e 's#/$##'
+}
+
 version_for() {
     local tool="$1"
     case "$tool" in
@@ -62,7 +77,7 @@ version_for() {
 
 add_tool() {
     local tool="$1"
-    local path version
+    local path version minimum
     path="$(command -v "$tool" 2>/dev/null || true)"
     if [[ -z "$path" || ! -x "$path" ]]; then
         printf '%s\t%s\t%s\n' "$tool" "missing" "" >>"$TOOLS_TSV"
@@ -77,6 +92,13 @@ add_tool() {
     if [[ -z "$version" ]]; then
         printf '%s\t%s\t%s\n' \
             "$tool" "$(normalize_path "$path")" "" >>"$TOOLS_TSV"
+        return 1
+    fi
+    minimum="$(utac_pinned_version "$TOOL_VERSIONS" "$tool" 2>/dev/null || true)"
+    if [[ -n "$minimum" ]] \
+        && ! utac_version_is_compatible "$version" "$minimum"; then
+        printf '%s\t%s\t%s\n' \
+            "$tool" "$(normalize_path "$path")" "$version" >>"$TOOLS_TSV"
         return 1
     fi
     printf '%s\t%s\t%s\n' \
@@ -111,10 +133,10 @@ check_core_tools() {
     done <"$REQUIRED_TOOLS"
     if ((${#unavailable[@]} == 0)); then
         add_check "core_tools" true \
-            "required commands resolve on PATH and report versions"
+            "required commands resolve on PATH and meet version requirements"
     else
         add_check "core_tools" false \
-            "missing or unusable: ${unavailable[*]}"
+            "missing, unusable, or unsupported: ${unavailable[*]}"
     fi
 }
 
@@ -130,17 +152,35 @@ check_kit_revision() {
 }
 
 check_update_remote() {
-    local upstream pull_remote pull_ref push_remote rebase
+    local upstream origin origin_id origin_push origin_push_id upstream_id
+    local pull_remote pull_ref push_remote branch_push_remote push_default
+    local rebase branch_rebase pull_ff
     upstream="$(git -C "$REPO_ROOT" remote get-url upstream 2>/dev/null || true)"
+    origin="$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null || true)"
+    origin_id="$(github_remote_identity "$origin")"
+    origin_push="$(git -C "$REPO_ROOT" remote get-url --push origin 2>/dev/null || true)"
+    origin_push_id="$(github_remote_identity "$origin_push")"
+    upstream_id="$(github_remote_identity "$upstream")"
     pull_remote="$(git -C "$REPO_ROOT" config --get branch.main.remote || true)"
     pull_ref="$(git -C "$REPO_ROOT" config --get branch.main.merge || true)"
     push_remote="$(git -C "$REPO_ROOT" config --get remote.pushDefault || true)"
+    branch_push_remote="$(git -C "$REPO_ROOT" config --get branch.main.pushRemote || true)"
+    push_default="$(git -C "$REPO_ROOT" config --get push.default || true)"
     rebase="$(git -C "$REPO_ROOT" config --get pull.rebase || true)"
+    branch_rebase="$(git -C "$REPO_ROOT" config --get branch.main.rebase || true)"
+    pull_ff="$(git -C "$REPO_ROOT" config --get pull.ff || true)"
     if [[ "$upstream" == "$UPSTREAM_URL" \
+        && -n "$origin" \
+        && "$origin_id" != "$upstream_id" \
+        && "$origin_push_id" == "$origin_id" \
         && "$pull_remote" == upstream \
         && "$pull_ref" == refs/heads/main \
         && "$push_remote" == origin \
-        && "$rebase" == false ]]
+        && "$branch_push_remote" == origin \
+        && "$push_default" == simple \
+        && "$rebase" == false \
+        && "$branch_rebase" == false \
+        && "$pull_ff" == true ]]
     then
         add_check "update_remote" true \
             "git pull reads the course template; git push writes personal origin"
@@ -226,18 +266,22 @@ check_secrets_roundtrip() {
     fi
 }
 
-has_plaintext_api_key() {
+has_plaintext_secret() {
     local path="$1"
     local line
     local shell_assignment_re
     local json_assignment_re
     local safe_re
     local empty_re
-    shell_assignment_re='(OPENAI|ANTHROPIC|GEMINI)_API_KEY[[:space:]]*='
-    json_assignment_re='"(OPENAI|ANTHROPIC|GEMINI)_API_KEY"[[:space:]]*:'
+    shell_assignment_re='((OPENAI|ANTHROPIC|GEMINI)_API_KEY|GITHUB_TOKEN|GH_TOKEN|GITHUB_PAT|GH_PAT)[[:space:]]*='
+    json_assignment_re='"((OPENAI|ANTHROPIC|GEMINI)_API_KEY|GITHUB_TOKEN|GH_TOKEN|GITHUB_PAT|GH_PAT)"[[:space:]]*:'
+    token_re='(^|[^[:alnum:]_])(gh[pousr]_[[:alnum:]]{20,}|github_''pat_[[:alnum:]_]{20,})'
     safe_re='[:=][[:space:]]*"?replace-me"?[[:space:]]*[,}]?[[:space:]]*(#.*)?$|[:=][[:space:]]*"?ENC\['
     empty_re='(=[[:space:]]*$|:[[:space:]]*""[[:space:]]*[,}]?[[:space:]]*$)'
     while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ $token_re ]]; then
+            return 0
+        fi
         [[ "$line" =~ $shell_assignment_re \
             || "$line" =~ $json_assignment_re ]] || continue
         [[ "$line" =~ $safe_re || "$line" =~ $empty_re ]] && continue
@@ -270,8 +314,8 @@ check_plaintext_leaks() {
             problems+=("${path}: age private key")
             continue
         fi
-        if has_plaintext_api_key "${REPO_ROOT}/${path}"; then
-            problems+=("${path}: plaintext API key assignment")
+        if has_plaintext_secret "${REPO_ROOT}/${path}"; then
+            problems+=("${path}: plaintext token or API-key assignment")
             continue
         fi
         if is_env_like "$path"; then
@@ -283,7 +327,7 @@ check_plaintext_leaks() {
     done < <(git -C "$REPO_ROOT" ls-files --cached --others --exclude-standard)
     if ((${#problems[@]} == 0)); then
         add_check "plaintext_leak_guard" true \
-            "no plaintext API keys, env files, or age keys tracked"
+            "no plaintext tokens, API keys, env files, or age keys tracked"
     else
         add_check "plaintext_leak_guard" false "${problems[*]}"
     fi
@@ -293,10 +337,11 @@ write_receipt() {
     local kit_rev
     kit_rev="$(tr -d '[:space:]' <"${REPO_ROOT}/KIT_REV")"
     python311 - "$VERSION" "$CHECKS_TSV" "$TOOLS_TSV" "$RECEIPT" \
-        "$kit_rev" <<'PY'
+        "$kit_rev" "$REPO_ROOT" <<'PY'
 from __future__ import annotations
 
 import json
+import hashlib
 import platform
 import sys
 from datetime import UTC, datetime
@@ -307,6 +352,7 @@ checks_tsv = Path(sys.argv[2])
 tools_tsv = Path(sys.argv[3])
 receipt = Path(sys.argv[4])
 kit_rev = sys.argv[5]
+repo_root = Path(sys.argv[6])
 
 checks = []
 for line in checks_tsv.read_text().splitlines():
@@ -325,6 +371,15 @@ payload = {
     "platform": {"os": platform.system(), "arch": platform.machine()},
     "checks": checks,
     "tools": tools,
+    "homework_files": {
+        relative: hashlib.sha256((repo_root / relative).read_bytes()).hexdigest()
+        for relative in (
+            "SUBMISSION.md",
+            "AGENTS.md",
+            "claude/settings.json",
+            "codex/config.seed.toml",
+        )
+    },
 }
 receipt.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 PY
@@ -351,20 +406,21 @@ main() {
     check_secrets_roundtrip
     check_plaintext_leaks
 
-    if ((FAILURES == 0)); then
-        write_receipt
-        printf 'wrote %s\n' "$RECEIPT" >&2
-        if check_homework_complete; then
-            printf 'HW0 complete: receipt, SUBMISSION.md, and agent section all present\n' >&2
-        else
-            printf 'setup receipt OK; HW0 items remain (TODO lines above)\n' >&2
-            return 2
-        fi
-    else
+    if ((FAILURES != 0)); then
         rm -f "$RECEIPT"
         printf 'self-check failed; receipt not written\n' >&2
         return 1
     fi
+    if ! check_homework_complete; then
+        rm -f "$RECEIPT"
+        printf 'HW0 items remain; receipt not written (TODO lines above)\n' >&2
+        return 2
+    fi
+    add_check "homework_complete" true \
+        "required submission, agent guidance, and permission policies pass"
+    write_receipt
+    printf 'wrote %s\n' "$RECEIPT" >&2
+    printf 'HW0 complete: receipt and required committed artifacts are current\n' >&2
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

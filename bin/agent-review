@@ -16,6 +16,7 @@ import shutil
 import stat
 import subprocess
 import sys
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -278,12 +279,16 @@ def validate_closing_memo(
 
 
 def require_premise_override(
-    findings: tuple[Finding, ...], reason: str | None
+    findings: tuple[Finding, ...],
+    assignments: Mapping[int, str],
+    reason: str | None,
 ) -> None:
     blockers = [
         finding.number
         for finding in findings
-        if finding.classification == "PREMISE" and finding.severity == "BLOCKER"
+        if finding.classification == "PREMISE"
+        and finding.severity == "BLOCKER"
+        and assignments.get(finding.number) == "Pushing back"
     ]
     if blockers and not (reason and reason.strip()):
         raise ReviewError(
@@ -768,11 +773,11 @@ def _continue(args: argparse.Namespace) -> None:
         raise ReviewError("current round has no response")
     findings = parse_findings(Path(state.response).read_text())
     override = cast(str | None, args.override_premise)
-    require_premise_override(findings, override)
     memo_path = Path(cast(str, args.memo)).resolve()
     if not memo_path.is_file():
         raise ReviewError(f"disposition memo is not a file: {memo_path}")
     memo = memo_path.read_text()
+    require_premise_override(findings, _memo_assignments(memo), override)
     validate_memo(
         memo,
         findings,
@@ -859,7 +864,7 @@ def _close_current_round(
     if not memo_path.is_file():
         raise ReviewError(f"disposition memo is not a file: {memo_path}")
     memo = memo_path.read_text()
-    require_premise_override(findings, override)
+    require_premise_override(findings, _memo_assignments(memo), override)
     validate_closing_memo(
         memo,
         findings,

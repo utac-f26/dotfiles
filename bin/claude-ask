@@ -189,9 +189,12 @@ set +e
 # Buffer stderr so stale-session detection has a complete, portable input.
 # Process substitution depends on /dev/fd behavior that is unreliable in the
 # macOS/sandbox environments this template supports; the loop below provides a
-# heartbeat while Claude runs, and diagnostics are replayed immediately after.
+# heartbeat while Claude runs. Monitor mode gives the invocation its own process
+# group so timeout cleanup includes tool subprocesses.
+set -m
 claude "${CLAUDE_ARGS[@]}" <"$PROMPT" >"$TEMP_JSON" 2>"$TEMP_ERR" &
 PID=$!
+set +m
 TIMED_OUT=0
 if [[ "$TIMEOUT_SECONDS" -gt 0 ]]; then
     START="$(date +%s)"
@@ -200,9 +203,9 @@ if [[ "$TIMEOUT_SECONDS" -gt 0 ]]; then
         ELAPSED=$((NOW - START))
         if [[ "$ELAPSED" -ge "$TIMEOUT_SECONDS" ]]; then
             TIMED_OUT=1
-            kill "$PID" 2>/dev/null
+            kill -TERM -- "-$PID" 2>/dev/null
             sleep 1
-            kill -9 "$PID" 2>/dev/null
+            kill -KILL -- "-$PID" 2>/dev/null
             break
         fi
         if [[ "$ELAPSED" -gt 0 && $((ELAPSED % 30)) -eq 0 ]]; then

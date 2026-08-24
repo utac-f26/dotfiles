@@ -65,9 +65,11 @@ It must contain your completed `SUBMISSION.md`, a current, valid
 `.setup-receipt.json`, your reviewed agent-written addition to `AGENTS.md`,
 your authored `permissions` block in `claude/settings.json`, and your Codex
 policy in `codex/config.seed.toml`. The receipt records passing functional
-checks plus the
-normalized path and non-empty version output for every required command,
-including `remote-run` and `with-secrets` as commands available on `PATH`.
+checks plus the normalized path and compatible version output for every
+required command, including `remote-run` and `with-secrets` as commands
+available on `PATH`. It is written only after the full homework check passes and
+binds SHA-256 digests of the four required committed artifacts, so later drift
+is rejected by the offline grader.
 
 Do not commit tokens, API keys, age private keys, plaintext `.env` files, or
 Claude/Codex runtime state. The self-check rejects those leak shapes before it

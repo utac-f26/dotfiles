@@ -37,10 +37,13 @@ one does not exist, writes `.sops.yaml` for your public age recipient, links the
 owned Claude settings and shared agent guidance, and seeds Codex's live config
 on a new machine. It also configures the course template as the source for
 `git pull` while keeping your personal repository as the destination for
-`git push`. Directly downloaded tools use explicit release versions and
-repository-owned SHA-256 checksums; Claude Code and Codex are pinned as well.
-`uv` provides Python 3.11 for the Python entry points. Existing compatible
-tools are left alone unless you run `./setup --update`. The toolchain needs
+`git push`; setup rejects a checkout whose `origin` is the public course
+repository. Directly downloaded tools use explicit release versions and
+repository-owned SHA-256 checksums; Claude Code, Codex, Ruff, and Pyright are
+pinned as well. `tool-versions.txt` defines compatibility: setup keeps an
+existing managed tool only when `--version` reports the same major and at least
+the listed version. `uv` provides Python 3.11 for the Python entry points.
+`./setup --update` reinstalls the listed versions. The toolchain needs
 roughly 1 GB free in your home directory; `setup` checks before downloading
 anything.
 

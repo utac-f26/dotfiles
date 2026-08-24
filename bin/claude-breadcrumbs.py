@@ -453,24 +453,25 @@ def _peek_session(path: Path) -> tuple[str, str]:
     title = ""
     prompt = ""
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        lines = path.open(encoding="utf-8")
     except OSError:
         return ("", "")
-    for line in lines:
-        try:
-            raw: Any = json.loads(line)  # Any: JSON boundary
-        except json.JSONDecodeError:
-            continue
-        entry = _as_entry(raw)
-        if entry is None:
-            continue
-        if entry.get("type") == "custom-title" and not title:
-            title = str(entry.get("title", ""))
-        if entry.get("type") == "user":
-            text = _user_prompt_text(entry)
-            if text is not None:
-                prompt = _truncate(text, 70)
-                break
+    with lines:
+        for line in lines:
+            try:
+                raw: Any = json.loads(line)  # Any: JSON boundary
+            except json.JSONDecodeError:
+                continue
+            entry = _as_entry(raw)
+            if entry is None:
+                continue
+            if entry.get("type") == "custom-title" and not title:
+                title = str(entry.get("title", ""))
+            if entry.get("type") == "user":
+                text = _user_prompt_text(entry)
+                if text is not None:
+                    prompt = _truncate(text, 70)
+                    break
     return (title, prompt)
 
 
