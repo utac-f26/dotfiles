@@ -4,7 +4,10 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 LOCAL_BIN="${HOME}/.local/bin"
 UPSTREAM_URL="$(tr -d '[:space:]' <"${REPO_ROOT}/upstream-url")"
-NODE_VERSION="${NODE_VERSION:-v22.17.1}"
+ASSET_CHECKSUMS="${REPO_ROOT}/asset-checksums.txt"
+NODE_VERSION="v22.17.1"
+NODE_MIN_MAJOR=22
+UV_VERSION="0.12.3"
 UPDATE=0
 SKIP_INSTALL="${DOTFILES_SKIP_INSTALL:-0}"
 MIN_FREE_MB="${DOTFILES_MIN_FREE_MB:-2000}"
@@ -34,14 +37,16 @@ pinned at the top of this script; --update reinstalls the pinned versions
 EOF
 }
 
-while (($#)); do
-    case "$1" in
-        --update) UPDATE=1 ;;
-        -h|--help) usage; exit 0 ;;
-        *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
-    esac
-    shift
-done
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    while (($#)); do
+        case "$1" in
+            --update) UPDATE=1 ;;
+            -h|--help) usage; exit 0 ;;
+            *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
+        esac
+        shift
+    done
+fi
 
 log() {
     printf 'setup: %s\n' "$*" >&2
@@ -59,6 +64,19 @@ have() {
 should_install() {
     local tool="$1"
     [[ "$UPDATE" == 1 ]] || ! have "$tool"
+}
+
+node_is_compatible() {
+    local version major
+    have node && have npm || return 1
+    version="$(node --version 2>/dev/null)" || return 1
+    [[ "$version" =~ ^v([0-9]+)(\.|$) ]] || return 1
+    major="${BASH_REMATCH[1]}"
+    ((major >= NODE_MIN_MAJOR))
+}
+
+should_install_node() {
+    [[ "$UPDATE" == 1 ]] || ! node_is_compatible
 }
 
 append_path_once() {
@@ -165,6 +183,7 @@ release_url() {
 download_asset() {
     local url="$1"
     local out="$2"
+    local checksum_name="${3:-${url##*/}}"
     if have curl; then
         curl -fsSL "$url" -o "$out"
     elif have wget; then
@@ -172,9 +191,31 @@ download_asset() {
     else
         die "need curl or wget to download $url"
     fi
+    verify_asset "$out" "$checksum_name"
 }
 
-# Isolate temporary-file cleanup so traps cannot leak into caller functions.
+verify_asset() {
+    local path="$1"
+    local checksum_name="$2"
+    local expected actual
+    [[ -f "$ASSET_CHECKSUMS" ]] || die \
+        "missing asset checksum manifest: $ASSET_CHECKSUMS"
+    expected="$(awk -v name="$checksum_name" '$2 == name {print $1}' \
+        "$ASSET_CHECKSUMS")"
+    [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || die \
+        "missing or ambiguous SHA-256 for $checksum_name"
+    if have sha256sum; then
+        actual="$(sha256sum "$path")"
+    elif have shasum; then
+        actual="$(shasum -a 256 "$path")"
+    else
+        die "need sha256sum or shasum to verify $checksum_name"
+    fi
+    actual="${actual%%[[:space:]]*}"
+    [[ "$actual" == "$expected" ]] || die \
+        "SHA-256 mismatch for $checksum_name"
+}
+
 trap_cleanup_dir() {
     local dir="$1"
     local cleanup
@@ -183,6 +224,9 @@ trap_cleanup_dir() {
     trap "$cleanup" EXIT
 }
 
+# Keep each cleanup trap inside its helper. A RETURN trap registered by a
+# normal function survives after its local variables disappear and fires again
+# when an outer function returns, which aborts setup under `set -u`.
 install_tar_binaries() (
     local url="$1"
     shift
@@ -213,22 +257,22 @@ install_single_binary() (
     install -m 0755 "$tmp/$name" "$LOCAL_BIN/$name"
 )
 
-install_uv() {
+install_uv() (
     if ! should_install uv; then
         return
     fi
-    log "installing uv"
-    if have curl; then
-        curl -LsSf https://astral.sh/uv/install.sh | sh
-    elif have wget; then
-        wget -qO- https://astral.sh/uv/install.sh | sh
-    else
-        die "need curl or wget to install uv"
-    fi
-}
+    local tmp installer
+    tmp="$(mktemp -d)"
+    trap_cleanup_dir "$tmp"
+    installer="$tmp/uv-install.sh"
+    log "installing uv $UV_VERSION"
+    download_asset "https://astral.sh/uv/${UV_VERSION}/install.sh" \
+        "$installer" "uv-${UV_VERSION}-install.sh"
+    sh "$installer"
+)
 
 install_node() (
-    if ! should_install node; then
+    if ! should_install_node; then
         return
     fi
     read -r os _ node_arch _ < <(platform)
@@ -323,7 +367,9 @@ install_agent_tools() {
     have npm || die "npm missing after Node install"
     if should_install claude; then
         log "installing Claude Code CLI"
-        npm install --global --prefix "${HOME}/.local" @anthropic-ai/claude-code
+        npm install --global --prefix "${HOME}/.local" \
+            "@anthropic-ai/claude-code@$(tr -d '[:space:]' \
+                <"${REPO_ROOT}/claude/pinned-version")"
     fi
     if should_install codex; then
         log "installing Codex CLI"
@@ -347,7 +393,10 @@ ensure_age_key() {
     local key_file="${HOME}/.config/sops/age/keys.txt"
     mkdir -p "$(dirname "$key_file")"
     if [[ -f "$key_file" ]]; then
-        log "age key already exists; leaving it untouched"
+        [[ ! -L "$key_file" ]] || die "age key must not be a symbolic link"
+        [[ -O "$key_file" ]] || die "age key is not owned by the current user"
+        chmod 0600 "$key_file"
+        log "age key already exists; enforced mode 0600"
         return
     fi
     have age-keygen || die "age-keygen missing; cannot create SOPS age key"
@@ -389,4 +438,6 @@ main() {
         "run ./self-check"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

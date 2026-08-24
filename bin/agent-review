@@ -77,6 +77,7 @@ class ReviewState:
     round: int
     statuses: dict[str, str]
     finding_numbers: tuple[int, ...] = ()
+    active_finding_numbers: tuple[int, ...] = ()
     blocked: bool = False
     response: str | None = None
     merge_base: str | None = None
@@ -153,18 +154,21 @@ def parse_findings(text: str) -> tuple[Finding, ...]:
 
 
 def validate_monotonic_findings(
-    findings: tuple[Finding, ...], seen_numbers: tuple[int, ...]
+    findings: tuple[Finding, ...],
+    seen_numbers: tuple[int, ...],
+    active_numbers: tuple[int, ...],
 ) -> None:
     """Require increasing output order and prohibit reuse of withdrawn ids."""
     numbers = [finding.number for finding in findings]
     if any(number < 1 for number in numbers) or numbers != sorted(numbers):
         raise ReviewError("finding numbers must be positive and monotonic")
     seen = set(seen_numbers)
+    withdrawn = seen - set(active_numbers)
     prior_max = max(seen, default=0)
     reused = [
         number
         for number in numbers
-        if number not in seen and number <= prior_max
+        if number in withdrawn or (number not in seen and number <= prior_max)
     ]
     if reused:
         raise ReviewError(f"withdrawn finding numbers cannot be reused: {reused}")
@@ -452,6 +456,15 @@ def _load_state(root: Path, reviewer: Reviewer, session: str | None) -> ReviewSt
         round=cast(int, raw["round"]),
         statuses=cast(dict[str, str], raw["statuses"]),
         finding_numbers=tuple(cast(list[int], raw.get("finding_numbers", []))),
+        # Older sessions did not persist the active subset. Treat all seen
+        # findings as active for their first resumed round, then write the
+        # exact current set with the new schema.
+        active_finding_numbers=tuple(
+            cast(
+                list[int],
+                raw.get("active_finding_numbers", raw.get("finding_numbers", [])),
+            )
+        ),
         blocked=cast(bool, raw.get("blocked", False)),
         response=cast(str | None, raw.get("response")),
         merge_base=cast(str | None, raw.get("merge_base")),
@@ -674,13 +687,18 @@ def _invoke_round(
         finding.classification == "PREMISE" and finding.severity == "BLOCKER"
         for finding in findings
     )
-    validate_monotonic_findings(findings, state.finding_numbers)
+    validate_monotonic_findings(
+        findings,
+        state.finding_numbers,
+        state.active_finding_numbers,
+    )
     all_numbers = tuple(
         sorted({*state.finding_numbers, *(finding.number for finding in findings)})
     )
     state = replace(
         state,
         finding_numbers=all_numbers,
+        active_finding_numbers=tuple(finding.number for finding in findings),
         blocked=premise_blocked,
         response=str(response),
     )
@@ -889,6 +907,7 @@ def _advance(args: argparse.Namespace) -> None:
         round=1,
         statuses=statuses,
         finding_numbers=(),
+        active_finding_numbers=(),
         blocked=False,
         response=None,
         merge_base=None,

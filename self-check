@@ -185,16 +185,27 @@ check_claude_auth() {
 check_age_key() {
     local key_file="${HOME}/.config/sops/age/keys.txt"
     local marker="AGE-SECRET-""KEY-"
-    if [[ -s "$key_file" ]] && grep -q "$marker" "$key_file"; then
-        add_check "age_key" true "age key exists outside the repo"
+    local mode=""
+    if [[ -e "$key_file" ]]; then
+        mode="$(stat -f '%Lp' "$key_file" 2>/dev/null \
+            || stat -c '%a' "$key_file" 2>/dev/null || true)"
+    fi
+    if [[ -s "$key_file" && ! -L "$key_file" && -O "$key_file" \
+        && "$mode" == 600 ]] \
+        && grep -q "$marker" "$key_file"
+    then
+        add_check "age_key" true \
+            "age key exists outside the repo with mode 0600"
     else
-        add_check "age_key" false "missing age key at ~/.config/sops/age/keys.txt"
+        add_check "age_key" false \
+            "age key must exist, be owned by you, and have mode 0600"
     fi
 }
 
 check_secrets_roundtrip() {
     local plain enc key_file recipient
-    # Place the plaintext fixture under secrets/ so it matches .sops.yaml.
+    # Keep the fixture outside the repository but under secrets/ so the path
+    # has the same shape as files governed by the repository's SOPS rule.
     plain="${TMP_DIR}/secrets/example.env"
     enc="${TMP_DIR}/example.sops.env"
     key_file="${HOME}/.config/sops/age/keys.txt"
@@ -213,6 +224,26 @@ check_secrets_roundtrip() {
     else
         add_check "secrets_roundtrip" false "SOPS/with-secrets dummy secret failed"
     fi
+}
+
+has_plaintext_api_key() {
+    local path="$1"
+    local line
+    local shell_assignment_re
+    local json_assignment_re
+    local safe_re
+    local empty_re
+    shell_assignment_re='(OPENAI|ANTHROPIC|GEMINI)_API_KEY[[:space:]]*='
+    json_assignment_re='"(OPENAI|ANTHROPIC|GEMINI)_API_KEY"[[:space:]]*:'
+    safe_re='[:=][[:space:]]*"?replace-me"?[[:space:]]*[,}]?[[:space:]]*(#.*)?$|[:=][[:space:]]*"?ENC\['
+    empty_re='(=[[:space:]]*$|:[[:space:]]*""[[:space:]]*[,}]?[[:space:]]*$)'
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ $shell_assignment_re \
+            || "$line" =~ $json_assignment_re ]] || continue
+        [[ "$line" =~ $safe_re || "$line" =~ $empty_re ]] && continue
+        return 0
+    done <"$path"
+    return 1
 }
 
 is_env_like() {
@@ -239,14 +270,20 @@ check_plaintext_leaks() {
             problems+=("${path}: age private key")
             continue
         fi
+        if has_plaintext_api_key "${REPO_ROOT}/${path}"; then
+            problems+=("${path}: plaintext API key assignment")
+            continue
+        fi
         if is_env_like "$path"; then
-            if ! grep -Eq '(^sops:|^sops_)' "${REPO_ROOT}/${path}"; then
+            if ! sops filestatus --input-type dotenv "${REPO_ROOT}/${path}" \
+                    2>/dev/null | jq -e '.encrypted == true' >/dev/null; then
                 problems+=("${path}: env-like file without SOPS metadata")
             fi
         fi
     done < <(git -C "$REPO_ROOT" ls-files --cached --others --exclude-standard)
     if ((${#problems[@]} == 0)); then
-        add_check "plaintext_leak_guard" true "no plaintext env files or age keys tracked"
+        add_check "plaintext_leak_guard" true \
+            "no plaintext API keys, env files, or age keys tracked"
     else
         add_check "plaintext_leak_guard" false "${problems[*]}"
     fi

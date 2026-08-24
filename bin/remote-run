@@ -37,6 +37,8 @@ CD_DIR=""
 DRY_RUN=false
 CLEAN_AGE=""
 SENTINEL="__remote-run__"
+# shellcheck disable=SC2088 # Literal user spelling, expanded on the remote.
+TILDE_PREFIX="~/"
 
 usage() {
     cat <<'EOF'
@@ -220,11 +222,20 @@ case "$MODE" in
         fi
         validate_window_name "$WINDOW_NAME"
 
-        # Build the inner command. Since this goes into a heredoc that
-        # becomes a script on the remote host, no special quoting is needed.
+        # Build the inner command. Quote --cd as remote shell data; preserve
+        # the documented ~/ spelling by expanding it through remote $HOME.
         INNER="$CMD"
         if [[ -n "$CD_DIR" ]]; then
-            INNER="cd $CD_DIR && $INNER"
+            if [[ "$CD_DIR" == "~" ]]; then
+                # shellcheck disable=SC2016 # Expand HOME on the remote host.
+                QUOTED_CD='$HOME'
+            elif [[ "${CD_DIR:0:2}" == "$TILDE_PREFIX" ]]; then
+                printf -v QUOTED_CD '%q' "${CD_DIR:2}"
+                QUOTED_CD="\$HOME/${QUOTED_CD}"
+            else
+                printf -v QUOTED_CD '%q' "$CD_DIR"
+            fi
+            INNER="cd $QUOTED_CD && $INNER"
         fi
 
         # --- Dry-run: show what would be sent and exit ---

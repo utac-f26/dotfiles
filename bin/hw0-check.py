@@ -94,14 +94,30 @@ def check_claude_permissions(root: Path) -> list[str]:
         return [f"claude/settings.json: author a permissions block ({guide})"]
     perms = cast("dict[str, object]", perms_value)
     todo: list[str] = []
-    valid_rules = {
-        key: [
-            rule
-            for rule in string_list(perms.get(key))
-            if RULE_RE.match(rule)
+    valid_rules: dict[str, list[str]] = {}
+    for key in ("allow", "ask", "deny"):
+        value = perms.get(key)
+        if value is None:
+            rules: list[str] = []
+        elif not isinstance(value, list) or not all(
+            isinstance(item, str) for item in cast("list[object]", value)
+        ):
+            todo.append(
+                f"claude/settings.json: permissions.{key} must be a list "
+                "of strings"
+            )
+            rules = []
+        else:
+            rules = cast("list[str]", value)
+        invalid = [rule for rule in rules if RULE_RE.fullmatch(rule) is None]
+        if invalid:
+            todo.append(
+                f"claude/settings.json: permissions.{key} contains invalid "
+                f"rules: {invalid!r}"
+            )
+        valid_rules[key] = [
+            rule for rule in rules if RULE_RE.fullmatch(rule) is not None
         ]
-        for key in ("allow", "ask", "deny")
-    }
     if not valid_rules["allow"]:
         todo.append(
             "claude/settings.json: permissions needs at least one valid "
@@ -177,6 +193,45 @@ def _policy_fields(
     )
 
 
+def _validate_sandbox_workspace_write(
+    data: dict[str, object], label: str, *, reject_unknown: bool
+) -> list[str]:
+    value = data.get("sandbox_workspace_write")
+    if value is None:
+        return []
+    if not isinstance(value, dict):
+        return [f"{label}: sandbox_workspace_write must be a table"]
+    sww = cast("dict[str, object]", value)
+    todo: list[str] = []
+    if reject_unknown:
+        for key in sww:
+            if key not in ALLOWED_SWW:
+                todo.append(
+                    f"{label}: [sandbox_workspace_write] key {key!r} is not "
+                    "part of the HW0 policy"
+                )
+    if "network_access" in sww and not isinstance(sww["network_access"], bool):
+        todo.append(
+            f"{label}: [sandbox_workspace_write] network_access must be true "
+            "or false"
+        )
+    if "writable_roots" in sww:
+        roots_value = sww["writable_roots"]
+        entries = (
+            cast("list[object]", roots_value)
+            if isinstance(roots_value, list)
+            else []
+        )
+        if not isinstance(roots_value, list) or not all(
+            isinstance(entry, str) for entry in entries
+        ):
+            todo.append(
+                f"{label}: [sandbox_workspace_write] writable_roots must be "
+                "a list of strings"
+            )
+    return todo
+
+
 def check_codex_policy(root: Path) -> list[str]:
     if tomllib is None:
         return [
@@ -198,34 +253,9 @@ def check_codex_policy(root: Path) -> list[str]:
                 f"codex/config.seed.toml: key {key!r} is not part of the "
                 f"HW0 policy ({guide})"
             )
-    sww_value = seed.get("sandbox_workspace_write")
-    if isinstance(sww_value, dict):
-        sww = cast("dict[str, object]", sww_value)
-        for key in sww:
-            if key not in ALLOWED_SWW:
-                todo.append(
-                    f"codex/config.seed.toml: [sandbox_workspace_write] key "
-                    f"{key!r} is not part of the HW0 policy"
-                )
-        if "network_access" in sww and not isinstance(
-            sww["network_access"], bool
-        ):
-            todo.append(
-                "codex/config.seed.toml: [sandbox_workspace_write] "
-                "network_access must be true or false"
-            )
-        if "writable_roots" in sww:
-            roots_value = sww["writable_roots"]
-            if isinstance(roots_value, list):
-                entries = cast("list[object]", roots_value)
-                all_strings = all(isinstance(entry, str) for entry in entries)
-            else:
-                all_strings = False
-            if not all_strings:
-                todo.append(
-                    "codex/config.seed.toml: [sandbox_workspace_write] "
-                    "writable_roots must be a list of strings"
-                )
+    todo += _validate_sandbox_workspace_write(
+        seed, "codex/config.seed.toml", reject_unknown=True
+    )
     if seed.get("approval_policy") not in ALLOWED_APPROVAL:
         todo.append(
             "codex/config.seed.toml: approval_policy must be 'untrusted' or "
@@ -255,6 +285,11 @@ def check_codex_policy(root: Path) -> list[str]:
     live, live_todo = _load_policy(live_path, "~/.codex/config.toml")
     if live_todo:
         return live_todo
+    todo += _validate_sandbox_workspace_write(
+        live, "~/.codex/config.toml", reject_unknown=False
+    )
+    if todo:
+        return todo
     labels = ("approval_policy", "sandbox_mode", "writable_roots", "network_access")
     for label, seed_val, live_val in zip(
         labels, _policy_fields(seed, home), _policy_fields(live, home), strict=True

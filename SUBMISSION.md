@@ -1,7 +1,7 @@
 # Submission
 
-Fill in every field below before you submit. This is your cover sheet — it tells
-the grader who submitted, how much effort it took, and who or what helped.
+The completion check requires Name, EID, Email, and Hours spent. Fill in the
+remaining disclosure fields when they apply or when they would help the grader.
 
 - Name:
 - EID:

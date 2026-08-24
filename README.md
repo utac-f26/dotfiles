@@ -37,10 +37,12 @@ one does not exist, writes `.sops.yaml` for your public age recipient, links the
 owned Claude settings and shared agent guidance, and seeds Codex's live config
 on a new machine. It also configures the course template as the source for
 `git pull` while keeping your personal repository as the destination for
-`git push`. Directly downloaded tools use explicit release versions and `uv`
-provides Python 3.11 for the Python entry points. Existing compatible tools are
-left alone unless you run `./setup --update`. The toolchain needs roughly 1 GB
-free in your home directory; `setup` checks before downloading anything.
+`git push`. Directly downloaded tools use explicit release versions and
+repository-owned SHA-256 checksums; Claude Code and Codex are pinned as well.
+`uv` provides Python 3.11 for the Python entry points. Existing compatible
+tools are left alone unless you run `./setup --update`. The toolchain needs
+roughly 1 GB free in your home directory; `setup` checks before downloading
+anything.
 
 It does not symlink the whole `~/.claude` or `~/.codex` directory. It also does
 not symlink Codex's live `config.toml`, which Codex rewrites with machine and
@@ -82,8 +84,8 @@ The files have deliberately narrow roles:
 - `codex/config.seed.toml` contains stable defaults. `./links` copies it only
   when `~/.codex/config.toml` is absent; after that, Codex owns the live file.
 - `.tmux.conf` is the portable tmux policy linked as `~/.tmux.conf`.
-- `required-tools.txt`, `KIT_REV`, and `upstream-url` are course-owned
-  manifests used by setup and the completion check.
+- `required-tools.txt`, `asset-checksums.txt`, `KIT_REV`, and `upstream-url`
+  are course-owned manifests used by setup and the completion check.
 - `.editorconfig` gives editors one formatting policy for the mixed shell,
   Python, Markdown, and Makefile tree.
 
@@ -246,8 +248,9 @@ also records the `KIT_REV`, the managed-link contract, and the pull/push
 routing.
 
 After the receipt, `self-check` also reports what is left of the homework
-itself: a `TODO` line for each unfilled `SUBMISSION.md` field, each unanswered
-agent-reflection question, and a missing `AGENTS.md` "My preferences" section.
+itself: a `TODO` line for each unfilled required identity/effort field, each
+unanswered agent-reflection question, and a missing `AGENTS.md` "My
+preferences" section.
 It exits clean only when nothing remains — rerun it when you think you are
 done.
 
