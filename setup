@@ -174,12 +174,13 @@ download_asset() {
     fi
 }
 
-install_tar_binaries() {
+# Isolate temporary-file cleanup so traps cannot leak into caller functions.
+install_tar_binaries() (
     local url="$1"
     shift
     local tmp archive bin found
     tmp="$(mktemp -d)"
-    trap 'rm -rf "$tmp"' RETURN
+    trap 'rm -rf -- "$tmp"' EXIT
     archive="$tmp/asset"
     log "downloading ${url##*/}"
     download_asset "$url" "$archive"
@@ -191,18 +192,18 @@ install_tar_binaries() {
         [[ -n "$found" ]] || die "${url##*/} did not contain $bin"
         install -m 0755 "$found" "$LOCAL_BIN/$bin"
     done
-}
+)
 
-install_single_binary() {
+install_single_binary() (
     local url="$1"
     local name="$2"
     local tmp
     tmp="$(mktemp -d)"
-    trap 'rm -rf "$tmp"' RETURN
+    trap 'rm -rf -- "$tmp"' EXIT
     log "downloading ${url##*/}"
     download_asset "$url" "$tmp/$name"
     install -m 0755 "$tmp/$name" "$LOCAL_BIN/$name"
-}
+)
 
 install_uv() {
     if ! should_install uv; then
@@ -218,7 +219,7 @@ install_uv() {
     fi
 }
 
-install_node() {
+install_node() (
     if ! should_install node; then
         return
     fi
@@ -227,7 +228,7 @@ install_node() {
     node_platform="${os}-${node_arch}"
     url="https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-${node_platform}.tar.xz"
     tmp="$(mktemp -d)"
-    trap 'rm -rf "$tmp"' RETURN
+    trap 'rm -rf -- "$tmp"' EXIT
     archive="$tmp/node.tar.xz"
     dest="${HOME}/.local/node-${NODE_VERSION}-${node_platform}"
     log "installing Node.js $NODE_VERSION"
@@ -238,7 +239,7 @@ install_node() {
     ln -sf "$dest/bin/node" "$LOCAL_BIN/node"
     ln -sf "$dest/bin/npm" "$LOCAL_BIN/npm"
     ln -sf "$dest/bin/npx" "$LOCAL_BIN/npx"
-}
+)
 
 install_release_tools() {
     if [[ "$SKIP_INSTALL" == 1 ]]; then
