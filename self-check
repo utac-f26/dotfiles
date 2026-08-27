@@ -227,8 +227,14 @@ check_age_key() {
     local marker="AGE-SECRET-""KEY-"
     local mode=""
     if [[ -e "$key_file" ]]; then
-        mode="$(stat -f '%Lp' "$key_file" 2>/dev/null \
-            || stat -c '%a' "$key_file" 2>/dev/null || true)"
+        # GNU first, BSD second. The reverse order looks equivalent but is not:
+        # on GNU, -f is --file-system, so '%Lp' is read as a FILE operand. That
+        # errors on '%Lp' (so the || fires) while still printing the real file's
+        # filesystem block to stdout, and the fallback's 600 is appended to it.
+        # mode then never equals 600 and age_key fails on every Linux machine.
+        # stat -c is rejected outright by BSD stat, so this order is safe there.
+        mode="$(stat -c '%a' "$key_file" 2>/dev/null \
+            || stat -f '%Lp' "$key_file" 2>/dev/null || true)"
     fi
     if [[ -s "$key_file" && ! -L "$key_file" && -O "$key_file" \
         && "$mode" == 600 ]] \

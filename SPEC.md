@@ -7,9 +7,12 @@ the setup works, and put the agent to work once on your own configuration. The
 point is using and judging the environment, not building a serious software
 system.
 
-The first class meeting walks through steps 1–7 as the in-class lab. Steps 8–10
-are your work outside of class: a passing receipt alone does not complete the
-assignment.
+The first class meeting verifies your department shell, your exact GitHub
+login, and access to the university agent accounts. Submit that GitHub login in
+Canvas so the course can seed your private repository. After the repository
+arrives, complete steps 1–10 outside of class: a passing receipt alone does not
+complete the assignment. The public `utac-f26/dotfiles` repository is a
+reference and update source, not your submission checkout.
 
 Generate the receipt on any supported machine where you work: a macOS, Linux,
 or WSL laptop, or your CS department Linux home. Department hosts are an
