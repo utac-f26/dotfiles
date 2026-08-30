@@ -85,7 +85,8 @@ tool_is_compatible() {
     local minimum="$2"
     local output
     have "$tool" || return 1
-    output="$("$tool" --version 2>&1 | head -n 1)" || return 1
+    output="$("$tool" --version 2>&1)" || return 1
+    output="$(utac_version_line "$output")" || return 1
     utac_version_is_compatible "$output" "$minimum"
 }
 
