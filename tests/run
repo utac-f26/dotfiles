@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Runs every tests/test-*.sh. Nothing else invokes these files, so run this
+# after touching setup, self-check, or lib/tool-versions.sh.
+
+TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+status=0
+ran=0
+
+for test in "${TESTS_DIR}"/test-*.sh; do
+    [[ -f "$test" ]] || continue
+    ran=$((ran + 1))
+    printf '=== %s\n' "$(basename "$test")"
+    if ! bash "$test"; then
+        status=1
+        printf '=== %s FAILED\n' "$(basename "$test")" >&2
+    fi
+done
+
+# A glob that matched nothing would otherwise report success.
+if ((ran == 0)); then
+    printf 'tests/run: no test files found in %s\n' "$TESTS_DIR" >&2
+    exit 1
+fi
+
+if ((status == 0)); then
+    printf 'tests/run: %d file(s) PASS\n' "$ran"
+else
+    printf 'tests/run: failures\n' >&2
+fi
+exit "$status"
