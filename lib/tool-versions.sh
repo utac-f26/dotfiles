@@ -29,3 +29,23 @@ utac_version_is_compatible() {
     ((actual_minor > minimum_minor)) && return 0
     ((actual_minor == minimum_minor && actual_patch >= minimum_patch))
 }
+
+utac_version_line() {
+    local output="$1"
+    local minimum="${2:-}"
+    local semver_re='(^|[^0-9])([0-9]+\.[0-9]+(\.[0-9]+)?)([^0-9]|$)'
+    local line
+
+    # Ignore leading diagnostics and keep the first line containing a real
+    # dotted version. When a minimum is known, reject unrelated versions from
+    # warnings (for example, a libc version reported before a tool version).
+    while IFS= read -r line; do
+        [[ "$line" =~ $semver_re ]] || continue
+        if [[ -z "$minimum" ]] \
+            || utac_version_is_compatible "$line" "$minimum"; then
+            printf '%s\n' "$line"
+            return 0
+        fi
+    done <<<"$output"
+    return 1
+}

@@ -69,10 +69,13 @@ github_remote_identity() {
 
 version_for() {
     local tool="$1"
+    local minimum="${2:-}"
+    local output
     case "$tool" in
-        ssh) ssh -V 2>&1 | head -n 1 ;;
-        *) "$tool" --version 2>&1 | head -n 1 ;;
+        ssh) output="$(ssh -V 2>&1)" || return 1 ;;
+        *) output="$("$tool" --version 2>&1)" || return 1 ;;
     esac
+    utac_version_line "$output" "$minimum"
 }
 
 add_tool() {
@@ -83,7 +86,8 @@ add_tool() {
         printf '%s\t%s\t%s\n' "$tool" "missing" "" >>"$TOOLS_TSV"
         return 1
     fi
-    if ! version="$(version_for "$tool")"; then
+    minimum="$(utac_pinned_version "$TOOL_VERSIONS" "$tool" 2>/dev/null || true)"
+    if ! version="$(version_for "$tool" "$minimum")"; then
         printf '%s\t%s\t%s\n' \
             "$tool" "$(normalize_path "$path")" "" >>"$TOOLS_TSV"
         return 1
@@ -94,7 +98,6 @@ add_tool() {
             "$tool" "$(normalize_path "$path")" "" >>"$TOOLS_TSV"
         return 1
     fi
-    minimum="$(utac_pinned_version "$TOOL_VERSIONS" "$tool" 2>/dev/null || true)"
     if [[ -n "$minimum" ]] \
         && ! utac_version_is_compatible "$version" "$minimum"; then
         printf '%s\t%s\t%s\n' \
