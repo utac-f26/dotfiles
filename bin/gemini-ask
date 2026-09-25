@@ -31,6 +31,7 @@ if [[ -z "$OUTPUT" ]]; then
     OUTPUT="${PROMPT%.*}.gemini.resp.md"
 fi
 
+rm -f -- "$OUTPUT"
 uv run --with google-genai python3 - "$MODEL" "$PROMPT" "$OUTPUT" <<'PY'
 from __future__ import annotations
 
@@ -40,8 +41,8 @@ from pathlib import Path
 from google import genai
 
 model = sys.argv[1]
-prompt = Path(sys.argv[2]).read_text()
 output = Path(sys.argv[3])
+prompt = Path(sys.argv[2]).read_text(encoding="utf-8")
 
 client = genai.Client()
 response = client.models.generate_content(
@@ -49,6 +50,9 @@ response = client.models.generate_content(
     contents=prompt,
 )
 text = response.text or ""
-output.write_text(text)
+if not text.strip():
+    raise RuntimeError("Gemini returned an empty response")
+output.write_text(text, encoding="utf-8")
+sys.stdout.reconfigure(encoding="utf-8")
 print(output)
 PY

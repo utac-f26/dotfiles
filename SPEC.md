@@ -71,8 +71,17 @@ policy in `codex/config.seed.toml`. The receipt records passing functional
 checks plus the normalized path and compatible version output for every
 required command, including `remote-run` and `with-secrets` as commands
 available on `PATH`. It is written only after the full homework check passes and
-binds SHA-256 digests of the four required committed artifacts, so later drift
-is rejected by the offline grader.
+binds SHA-256 digests of the four required committed artifacts.
+
+Those digests are graded at the commit that carries the receipt, not at whatever
+`main` holds later, so run `./self-check` and commit the receipt together with
+the four files it binds. The repository's pre-commit hook refuses a commit whose
+receipt does not match the bound files being committed; stage the copies you
+checked, or rerun `./self-check`. After that the repository is yours again: later edits
+land on later commits and do not disturb your submission. Rerun `./self-check`
+and commit the new receipt whenever you want to re-pin it. Do not rewrite pushed
+history on `main` — force-pushing or rebasing away the commit that carries your
+receipt destroys the state you were graded on.
 
 Do not commit tokens, API keys, age private keys, plaintext `.env` files, or
 Claude/Codex runtime state. The self-check rejects those leak shapes before it

@@ -1,4 +1,6 @@
 {
+  "autoMemoryEnabled": false,
+  "cleanupPeriodDays": 120,
   "hooks": {
     "SessionEnd": [
       {
@@ -8,6 +10,15 @@
             "type": "command",
             "command": "\"$HOME/dotfiles/bin/claude-breadcrumbs.py\" sessionend",
             "timeout": 10
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/dotfiles/bin/agent-log-keeper\" claude",
+            "timeout": 60
           }
         ]
       }
@@ -20,6 +31,26 @@
             "type": "command",
             "command": "\"$HOME/dotfiles/bin/claude-breadcrumbs.py\" sessionstart",
             "timeout": 10
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/dotfiles/bin/agent-log-keeper\" claude",
+            "timeout": 60
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/dotfiles/bin/agent-log-keeper\" claude",
+            "timeout": 60
           }
         ]
       }

@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# Refuse to commit a setup receipt that certifies files other than the ones
+# in the commit.
+#
+# ./self-check hashes the working tree into .setup-receipt.json, and the
+# grader reads those digests at the commit that carries the receipt. Between
+# the two sit `git add` and any edit made after the check. A bound file that
+# was edited after the check, or checked but never staged, gives a receipt
+# whose digests match no commit on main, and that repository grades as
+# invalid. Both happened in the first cohort.
+#
+# The hook runs only when the receipt itself is staged. Later commits may
+# change the bound files freely: they leave the graded commit alone.
+# ./setup installs it with `git config core.hooksPath hooks`.
+set -euo pipefail
+
+RECEIPT=".setup-receipt.json"
+
+have() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+fail() {
+    printf 'pre-commit: %s\n' "$*" >&2
+    exit 1
+}
+
+# The receipt is not part of this commit: nothing to certify.
+if git diff --cached --quiet -- "$RECEIPT"; then
+    exit 0
+fi
+# Removing the receipt is allowed.
+if ! git cat-file -e ":${RECEIPT}" 2>/dev/null; then
+    exit 0
+fi
+have jq || fail "jq is required to check ${RECEIPT}; run ./setup"
+
+sha256_stdin() {
+    if have sha256sum; then
+        sha256sum
+    elif have shasum; then
+        shasum -a 256
+    else
+        return 1
+    fi
+}
+
+# Digest of the staged copy of a path. The bytes go through a pipe rather
+# than a variable: command substitution strips trailing newlines, which
+# would change the digest.
+staged_digest() {
+    local path="$1" line
+    git cat-file -e ":${path}" 2>/dev/null || return 1
+    line="$(git show ":${path}" | sha256_stdin)" || return 1
+    printf '%s' "${line%%[[:space:]]*}"
+}
+
+bound="$(git show ":${RECEIPT}" \
+    | jq -r '.homework_files // {} | to_entries[] | "\(.value)\t\(.key)"')" \
+    || fail "staged ${RECEIPT} is not a receipt; rerun ./self-check"
+
+problems=()
+while IFS=$'\t' read -r expected path; do
+    [[ -n "$path" ]] || continue
+    if ! actual="$(staged_digest "$path")"; then
+        problems+=("${path}: not in this commit (git add it)")
+    elif [[ "$actual" != "$expected" ]]; then
+        problems+=("${path}: differs from the copy ./self-check certified")
+    fi
+done <<<"$bound"
+
+if ((${#problems[@]} == 0)); then
+    exit 0
+fi
+{
+    printf 'pre-commit: %s certifies files that are not in this commit:\n' \
+        "$RECEIPT"
+    printf '  %s\n' "${problems[@]}"
+    printf 'Stage the copies you checked (git add FILE), or rerun ./self-check\n'
+    printf 'and stage the new receipt. Nothing was committed.\n'
+} >&2
+exit 1

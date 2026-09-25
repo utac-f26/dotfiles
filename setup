@@ -38,9 +38,10 @@ usage() {
 usage: ./setup [--update]
 
 Installs the course toolchain without root, creates the SOPS age key if needed,
-and links the student-owned Claude/Codex config files. Managed tool versions are
-pinned in tool-versions.txt; --update reinstalls those versions (bump the
-contract and asset checksums first to move forward).
+links the student-owned Claude/Codex config files, and installs the repository's
+Git hooks. Managed tool versions are pinned in tool-versions.txt; --update
+reinstalls those versions (bump the contract and asset checksums first to move
+forward).
 EOF
 }
 
@@ -185,6 +186,17 @@ configure_git_updates() {
     git -C "$REPO_ROOT" config push.default simple
     git -C "$REPO_ROOT" config pull.rebase false
     git -C "$REPO_ROOT" config pull.ff true
+}
+
+configure_git_hooks() {
+    # Git does not clone hooks. The repository tracks them under hooks/ and
+    # this points Git there. The path is relative, resolved against the
+    # working tree when a hook runs, so a moved checkout keeps working.
+    local existing
+    existing="$(git -C "$REPO_ROOT" config --get core.hooksPath 2>/dev/null || true)"
+    [[ "$existing" == hooks ]] && return
+    git -C "$REPO_ROOT" config core.hooksPath hooks
+    log "installed repository Git hooks from hooks/"
 }
 
 # Department home directories are quota'd, and the toolchain (Node tree,
@@ -473,6 +485,7 @@ main() {
     cd "$REPO_ROOT"
     platform >/dev/null    # fail on unsupported platforms before mutating HOME
     configure_git_updates
+    configure_git_hooks
     ensure_path
     install_release_tools
     install_agent_tools

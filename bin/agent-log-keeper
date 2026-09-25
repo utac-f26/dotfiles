@@ -1,0 +1,393 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# ///
+"""Keep your own copy of each agent session log from a course repository.
+
+Usage (as an agent hook; the hook JSON arrives on stdin):
+  agent-log-keeper claude    Claude Code SessionStart, Stop, SessionEnd
+  agent-log-keeper codex     Codex SessionStart, Stop, SessionEnd
+
+A course repository ships `agent_usage.py`, which records at each commit which
+documents your coding agents read. It reads the agents' own session logs, and
+Claude Code deletes those after `cleanupPeriodDays`. This hook hard-links each
+session log from a course repository into a private directory on your machine,
+so the record can still be computed after the agent has cleaned up:
+
+  <state>/logs/claude/<path under ~/.claude/projects>   (plus subagent logs)
+  <state>/logs/codex/<path under ~/.codex/sessions or archived_sessions>
+
+<state> is $AGENT_USAGE_HOME, else %LOCALAPPDATA%/agent-usage on Windows, else
+$XDG_STATE_HOME/agent-usage, else ~/.local/state/agent-usage. A hard link costs
+no space; where one cannot be made the log is copied instead. Nothing leaves
+your machine and nothing is written into the repository.
+
+At SessionStart it also installs the repository's agent-usage git pre-commit
+and post-commit hooks if either is missing, by running `agent_usage.py --install`.
+
+A course repository is one whose top holds KIT_REV and agent_usage.py and
+whose `origin` is in the course's GitHub organization (read from this dotfiles
+repository's `upstream-url`). Every other directory is left alone.
+
+The hook prints nothing on stdout (Claude Code would put it in the model's
+context) and always exits 0. Failures go, one line each, to
+<state>/keeper-errors.log.
+"""
+
+# pyright: strict
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime
+from functools import partial
+from pathlib import Path
+from typing import cast
+
+AGENTS = ("claude", "codex")
+HOOK_MARKER = b"agent-usage pre-commit hook"
+POST_HOOK_MARKER = b"agent-usage post-commit hook"
+INSTALL_TIMEOUT = 45  # seconds: under the agents' 60 s hook timeout, so it is logged
+GIT_TIMEOUT = 10  # seconds
+
+
+@dataclass(frozen=True, slots=True)
+class Hook:
+    """The fields the keeper reads from an agent's hook JSON."""
+
+    cwd: str | None
+    transcript: str | None
+    session: str | None
+    event: str | None
+
+
+def state_dir() -> Path:
+    """$AGENT_USAGE_HOME; else %LOCALAPPDATA%/agent-usage on Windows;
+    else $XDG_STATE_HOME/agent-usage; else ~/.local/state/agent-usage.
+
+    The same rule as agent_usage.py's. A value that is not absolute after
+    expanding `~` is skipped: the hook runs in the course repository, and a
+    relative directory would put raw transcripts in the student's work tree.
+    """
+    explicit = os.environ.get("AGENT_USAGE_HOME")
+    if explicit:
+        path = Path(explicit).expanduser()
+        if path.is_absolute():
+            return path
+    if os.name == "nt":
+        local = os.environ.get("LOCALAPPDATA")
+        if local and Path(local).is_absolute():
+            return Path(local) / "agent-usage"
+    xdg = os.environ.get("XDG_STATE_HOME")
+    if xdg and Path(xdg).is_absolute():
+        return Path(xdg) / "agent-usage"
+    return Path.home() / ".local" / "state" / "agent-usage"
+
+
+def claude_home() -> Path:
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+
+
+def codex_home() -> Path:
+    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+
+
+def parse_hook(data: bytes) -> Hook:
+    """Parse the hook JSON from its raw bytes.
+
+    Bytes, not sys.stdin text: on a Windows pipe stdin decodes as cp1252, which
+    mangles the non-ASCII paths in a UTF-8 payload.
+    """
+    raw: object = json.loads(data)
+    if not isinstance(raw, dict):
+        raise ValueError("hook input is not a JSON object")
+    payload = cast(dict[str, object], raw)  # JSON boundary: keys are strings
+
+    def text_field(name: str) -> str | None:
+        value = payload.get(name)
+        return value if isinstance(value, str) and value else None
+
+    return Hook(
+        cwd=text_field("cwd"),
+        transcript=text_field("transcript_path"),
+        session=text_field("session_id"),
+        event=text_field("hook_event_name"),
+    )
+
+
+# ------------------------------------------------------------ course repository
+
+
+def _native(path_text: str) -> str:
+    """MSYS2 git writes /c/Users/...; Windows Python needs C:/Users/..."""
+    match = re.match(r"^/([a-zA-Z])/(.*)$", path_text)
+    if os.name == "nt" and match:
+        return f"{match.group(1)}:/{match.group(2)}"
+    return path_text
+
+
+def find_top(start: Path) -> Path | None:
+    """The checkout containing START: the nearest directory holding `.git`.
+
+    Walks up instead of asking git, whose --show-toplevel prints MSYS paths on
+    Windows. In a linked worktree `.git` is a file, hence exists().
+    """
+    here = start.resolve()
+    return next((d for d in (here, *here.parents) if (d / ".git").exists()), None)
+
+
+def git_common_dir(top: Path) -> Path:
+    """The directory holding the hooks every worktree of TOP shares."""
+    dot_git = top / ".git"
+    if not dot_git.is_file():
+        return dot_git
+    text = dot_git.read_text(encoding="utf-8").strip()
+    gitdir = Path(_native(text.removeprefix("gitdir:").strip()))
+    gitdir = gitdir if gitdir.is_absolute() else top / gitdir
+    commondir = gitdir / "commondir"
+    if not commondir.is_file():
+        return gitdir
+    # An absolute commondir replaces gitdir under `/`.
+    return gitdir / _native(commondir.read_text(encoding="utf-8").strip())
+
+
+# [scheme://][user@]host[:port]/org/... or scp-style [user@]host:org/...,
+# anchored at the start so that neither a path segment nor a longer host name
+# can stand in for the course's host.
+_REMOTE = re.compile(
+    r"^(?:[a-z][a-z0-9+.-]*://)?(?:[^@/]+@)?(?P<host>[^/:@]+)(?::\d+)?[:/]"
+    r"(?P<org>[^/]+)/",
+    re.IGNORECASE,
+)
+
+
+def host_org(url: str) -> tuple[str, str] | None:
+    """(host, organization) of a git remote URL, lowercased, or None."""
+    match = _REMOTE.match(url.strip())
+    if match is None:
+        return None
+    return match["host"].lower(), match["org"].lower()
+
+
+def course_host_org() -> tuple[str, str]:
+    """The host and organization of this dotfiles repository's upstream.
+
+    The keeper is reached through a ~/bin symlink, so resolve it first.
+    """
+    upstream = Path(__file__).resolve().parent.parent / "upstream-url"
+    url = upstream.read_text(encoding="utf-8")
+    found = host_org(url)
+    if found is None:
+        raise ValueError(f"no host and organization in {upstream}: {url.strip()!r}")
+    return found
+
+
+def course_repo(cwd: str | None) -> Path | None:
+    """The top of the course repository containing CWD, or None."""
+    if cwd is None:
+        return None
+    top = find_top(Path(cwd))
+    if top is None:
+        return None
+    if not ((top / "KIT_REV").is_file() and (top / "agent_usage.py").is_file()):
+        return None
+    course = course_host_org()
+    origin = subprocess.run(
+        ["git", "-C", str(top), "remote", "get-url", "origin"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=GIT_TIMEOUT,
+        check=False,
+    )
+    if origin.returncode != 0:
+        return None
+    return top if host_org(origin.stdout) == course else None
+
+
+# ------------------------------------------------------------------ preservation
+
+
+def _under(path: Path, root: Path) -> Path | None:
+    """PATH relative to ROOT, lexically or after resolving links, else None."""
+    for inner, outer in (
+        (Path(os.path.abspath(path)), Path(os.path.abspath(root))),
+        (path.resolve(), root.resolve()),
+    ):
+        try:
+            return inner.relative_to(outer)
+        except ValueError:
+            continue
+    return None
+
+
+def claude_logs(transcript: Path) -> list[tuple[Path, Path]]:
+    """(source, preserved path under logs/) for a Claude session.
+
+    A session's subagent logs live beside it, under `<session id>/`.
+    """
+    rel = _under(transcript, claude_home() / "projects")
+    if rel is None:
+        return []
+    pairs = [(transcript, Path("claude") / rel)]
+    sidecar = transcript.with_suffix("")
+    if sidecar != transcript and sidecar.is_dir():
+        for sub in sorted(sidecar.rglob("*.jsonl"), key=lambda p: p.as_posix()):
+            pairs.append(
+                (sub, Path("claude") / rel.with_suffix("") / sub.relative_to(sidecar))
+            )
+    return pairs
+
+
+def codex_logs(transcript: Path) -> list[tuple[Path, Path]]:
+    """(source, preserved path under logs/) for a Codex rollout."""
+    home = codex_home()
+    for root in (home / "sessions", home / "archived_sessions"):
+        rel = _under(transcript, root)
+        if rel is not None:
+            return [(transcript, Path("codex") / rel)]
+    return []
+
+
+def preserve(src: Path, dst: Path) -> None:
+    """Hard-link SRC at DST; copy when a link cannot be made or DST is stale."""
+    if not src.is_file():
+        return  # Claude creates its log at the first prompt, not at SessionStart
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        if os.path.samefile(src, dst):
+            return
+        if _same_stamp(src, dst):
+            return  # the copy is current: copy2 kept the source's mtime
+    else:
+        try:
+            os.link(src, dst)
+            return
+        except FileExistsError:
+            if os.path.samefile(src, dst):
+                return  # a concurrent hook linked it first
+        except OSError:
+            pass  # another filesystem, or links unsupported: copy instead
+    # Per process, so an overlapping Stop and SessionEnd never share one; the
+    # suffix is not .jsonl, so a reader never takes it for a log.
+    staging = dst.with_name(f"{dst.name}.{os.getpid()}.keeper-tmp")
+    try:
+        shutil.copy2(src, staging)
+        os.replace(staging, dst)  # atomic: a reader sees the old copy or the new
+    except BaseException:
+        staging.unlink(missing_ok=True)
+        raise
+
+
+def _same_stamp(src: Path, dst: Path) -> bool:
+    ours, theirs = src.stat(), dst.stat()
+    return (ours.st_size, ours.st_mtime_ns) == (theirs.st_size, theirs.st_mtime_ns)
+
+
+# ---------------------------------------------------------------------- git hook
+
+
+def install_git_hook(top: Path) -> None:
+    """Run `agent_usage.py --install` unless both marked hooks are in place.
+
+    A frozen agent_usage.py without --install never names the marker, and is
+    never launched.
+    """
+    script = top / "agent_usage.py"
+    if HOOK_MARKER not in script.read_bytes():
+        return
+    hooks = git_common_dir(top) / "hooks"
+    pre = hooks / "pre-commit"
+    post = hooks / "post-commit"
+    if (pre.is_file() and HOOK_MARKER in pre.read_bytes()
+            and post.is_file() and POST_HOOK_MARKER in post.read_bytes()):
+        return
+    subprocess.run(
+        ["uv", "run", "--script", str(script), "--install"],
+        cwd=top,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=INSTALL_TIMEOUT,
+        check=True,
+    )
+
+
+# --------------------------------------------------------------------- the hook
+
+
+def record_failure(agent: str, hook: Hook | None, exc: BaseException) -> None:
+    """Append one line to <state>/keeper-errors.log; never raise."""
+    try:
+        stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        fields = [
+            stamp,
+            agent,
+            hook.event if hook else None,
+            hook.session if hook else None,
+            f"{type(exc).__name__}:",
+            str(exc),
+        ]
+        line = " ".join(_one_line(field) for field in fields)
+        state = state_dir()  # Path.home() raises RuntimeError without a home
+        state.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with (state / "keeper-errors.log").open(
+            "a", encoding="utf-8", newline="\n"
+        ) as log:
+            log.write(line + "\n")
+    except Exception:  # noqa: BLE001 -- best effort; the hook still exits 0
+        pass
+
+
+def _one_line(field: str | None) -> str:
+    """FIELD with every run of whitespace, newlines included, as one space."""
+    return " ".join((field or "").split()) or "-"
+
+
+def attempt(agent: str, hook: Hook, action: Callable[[], None]) -> None:
+    try:
+        action()
+    except Exception as exc:  # noqa: BLE001 -- a hook must never fail its agent
+        record_failure(agent, hook, exc)
+
+
+def keep(agent: str, hook: Hook) -> None:
+    top = course_repo(hook.cwd)
+    if top is None:
+        return
+    if hook.transcript is not None:
+        transcript = Path(hook.transcript)
+        logs = claude_logs if agent == "claude" else codex_logs
+        pairs = logs(transcript)
+        if pairs:
+            state = state_dir()
+            state.mkdir(mode=0o700, parents=True, exist_ok=True)
+            for src, rel in pairs:
+                dst = state / "logs" / rel
+                attempt(agent, hook, partial(preserve, src, dst))
+    if hook.event == "SessionStart":
+        attempt(agent, hook, partial(install_git_hook, top))
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = sys.argv[1:] if argv is None else argv
+    agent = args[0] if len(args) == 1 else ""
+    hook: Hook | None = None
+    try:
+        if agent not in AGENTS:
+            raise ValueError(f"usage: agent-log-keeper claude|codex, got {args!r}")
+        hook = parse_hook(sys.stdin.buffer.read())
+        keep(agent, hook)
+    except BaseException as exc:  # noqa: BLE001 -- exit 0 on every path
+        record_failure(agent, hook, exc)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

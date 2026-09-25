@@ -194,6 +194,21 @@ check_update_remote() {
     fi
 }
 
+check_commit_hook() {
+    # hooks/pre-commit refuses a receipt whose digests do not match the
+    # files being committed, which is the only way a receipt written here
+    # ends up certifying bytes that never reached main.
+    local hooks_path
+    hooks_path="$(git -C "$REPO_ROOT" config --get core.hooksPath 2>/dev/null || true)"
+    if [[ "$hooks_path" == hooks && -x "${REPO_ROOT}/hooks/pre-commit" ]]; then
+        add_check "commit_hook" true \
+            "git commit refuses a receipt that certifies other bytes"
+    else
+        add_check "commit_hook" false \
+            "rerun ./setup to install the repository's commit hook"
+    fi
+}
+
 check_github_auth() {
     if gh auth status --hostname github.com >/dev/null 2>&1; then
         add_check "github_auth" true "GitHub CLI authenticated to github.com"
@@ -414,6 +429,7 @@ main() {
     check_managed_links
     check_kit_revision
     check_update_remote
+    check_commit_hook
     check_core_tools
     check_github_auth
     check_codex_auth

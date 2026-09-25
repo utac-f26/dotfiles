@@ -30,6 +30,10 @@ rather than a nudge:
 - Deliver the scope you were asked for. Do not tidy, refactor, or extend
   adjacent code on your own initiative; raise a better approach in a sentence
   and proceed with the task as asked.
+- A concrete request to create, edit, or fix a local artifact authorizes the
+  edit. Do the work and leave a reviewable result without an extra approval
+  round. Pushes, submissions, messages, and other actions visible to others
+  require the user to request that action after inspecting the exact content.
 - Verify against something external — the test suite, the linter, the
   assignment spec — not by re-reading your own output. One such pass is enough;
   do not stack a second self-review on top of it.
@@ -61,8 +65,9 @@ rather than a nudge:
 - Use `remote-run`, not raw SSH, for work that may outlive the connection.
 - Use one exact department hostname, never the `linux.cs.utexas.edu` pool alias;
   tmux sessions belong to the host where they start.
-- Commit and push required local work, then pull the remote checkout before
-  dispatch. Do not edit the same branch concurrently on laptop and remote.
+- Before dispatch, commit required local work. If the remote needs that commit,
+  leave it for the user to inspect and request a push, then pull the remote
+  checkout. Do not edit the same branch concurrently on laptop and remote.
 - Name every job with `--name`. After launch, report its host and window plus
   the `--check`, `--log`, and `--attach` commands needed to resume it.
 - Use raw SSH only for short bounded operations such as `hostname` or a remote

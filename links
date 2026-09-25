@@ -46,6 +46,9 @@ link_one() {
     fi
     ln -s "$src" "$dst"
     log "linked $dst -> $src"
+    if [[ "$dst" == "${HOME}/.codex/hooks.json" ]]; then
+        log 'Codex will ask you to review these hooks; choose "Trust all and continue"'
+    fi
 }
 
 seed_codex_config() {
@@ -109,6 +112,7 @@ main() {
         "${REPO_ROOT}/claude/commands|${HOME}/.claude/commands"
         "${REPO_ROOT}/claude/skills|${HOME}/.claude/skills"
         "${REPO_ROOT}/AGENTS.md|${HOME}/.codex/AGENTS.md"
+        "${REPO_ROOT}/codex/hooks.json|${HOME}/.codex/hooks.json"
         # Agent Skills uses ~/.agents/skills as the client-neutral scope, so
         # Codex sees this skill too. codex-review stays Claude-only: it
         # launches a separate Codex reviewer and must not review itself.

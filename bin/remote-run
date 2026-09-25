@@ -4,39 +4,51 @@
 # Usage:
 #   remote-run HOST COMMAND [ARG ...]       Run argv in a new tmux window
 #   remote-run HOST 'SHELL COMMAND'         Run a pipeline or shell expression
+#   remote-run --script FILE HOST [ARG ...] Run a local shell script remotely
 #   remote-run --check HOST NAME           Check if a command finished
-#   remote-run --log HOST NAME             Capture output from a window
+#   remote-run --log HOST NAME             Print a job's output, live or retained
 #   remote-run --attach HOST [NAME]        Attach to session or specific window
 #   remote-run --kill HOST NAME            Kill a window
 #   remote-run --list HOST                 List windows in the worker session
-#   remote-run --clean HOST               Kill all finished windows
-#   remote-run --clean --age HOURS HOST    Kill old finished windows
+#   remote-run --clean HOST                Reap every finished window now
 #
 # Options:
 #   --name NAME     Name the tmux window (default: derived from command)
 #   --cd DIR        Change to DIR before running the command (remote path)
+#   --script FILE   Run a local bash/sh script with the given arguments
 #   --session NAME  Use a different tmux session (default: worker)
 #   --dry-run       Print the generated script instead of executing it
 #   --version       Print the remote-run version
 #
+# Environment:
+#   REMOTE_RUN_LOG_RETENTION_DAYS  Days to keep a reaped job's log (default: 30)
+#
 # The remote host must have tmux installed and SSH key access configured.
 # Commands run via bash -l, with the course user-space paths exported explicitly.
 #
-# Auto-clean: when spawning a new window, any *successful* (exit 0)
-# dead windows are reaped silently so the worker session doesn't
-# accumulate cruft. Failed windows (non-zero exit) are kept forever
-# so they're there when you want to debug them — use `--clean` to
-# reap those explicitly.
+# Output: the job's stdout and stderr are tee'd into
+# ~/.local/state/remote-run/<session>/<window>.<start-epoch>.log on the host,
+# between a header naming the command and a trailer naming the exit status,
+# so the pane shows the output live and the log outlives the pane. The job
+# writes to a pipe rather than a terminal, so block-buffered programs reach
+# the log when they flush.
+#
+# Reaping: every launch and `--clean` remove every finished window whose exit
+# status was recorded, whatever the status, and gzip the logs of windows that
+# no longer exist. Logs older than the retention are deleted. --log and
+# --check read the retained log once the window is gone. A finished window
+# whose status is unavailable is kept and reported.
 set -euo pipefail
 
-VERSION="1.0"
+VERSION="1.1"
 SESSION="worker"
 MODE="run"
 WINDOW_NAME=""
 CD_DIR=""
+SCRIPT_FILE=""
 DRY_RUN=false
-CLEAN_AGE=""
 SENTINEL="__remote-run__"
+LOG_RETENTION_DAYS="${REMOTE_RUN_LOG_RETENTION_DAYS:-30}"
 # shellcheck disable=SC2088 # Literal user spelling, expanded on the remote.
 TILDE_PREFIX="~/"
 
@@ -45,21 +57,27 @@ usage() {
 usage:
   remote-run [OPTIONS] HOST COMMAND [ARG ...]
   remote-run [OPTIONS] HOST 'SHELL COMMAND'
+  remote-run [OPTIONS] --script FILE HOST [ARG ...]
   remote-run --check HOST NAME
   remote-run --log HOST NAME
   remote-run --attach HOST [NAME]
   remote-run --kill HOST NAME
   remote-run --list HOST
-  remote-run --clean [--age HOURS] HOST
+  remote-run --clean HOST
 
 Run remote commands in named tmux windows that survive SSH disconnection.
 Options must precede HOST:
   --name NAME       tmux window name (default: derived from command)
   --cd DIR          remote working directory
+  --script FILE     local bash/sh script to run with ARG as its parameters
   --session NAME    tmux session (default: worker)
   --dry-run         print the generated remote script
   --version         print the remote-run version
   -h, --help        show this help
+
+A job's output is kept in ~/.local/state/remote-run/ on the host for
+REMOTE_RUN_LOG_RETENTION_DAYS (30) after its window is reaped; --log and
+--check read it there once the window is gone.
 
 Use one exact department hostname, not the linux.cs.utexas.edu pool alias.
 The remote host must have SSH key access, bash, and tmux.
@@ -87,17 +105,19 @@ while [[ $# -gt 0 ]]; do
             CD_DIR="$2"
             shift 2
             ;;
+        --script)
+            (($# >= 2)) || die "--script requires a value"
+            [[ -z "$SCRIPT_FILE" ]] || die "--script may be specified only once"
+            [[ -n "$2" ]] || die "script file is missing or unreadable: empty path"
+            SCRIPT_FILE="$2"
+            shift 2
+            ;;
         --session)
             (($# >= 2)) || die "--session requires a value"
             SESSION="$2"
             shift 2
             ;;
         --dry-run) DRY_RUN=true; shift ;;
-        --age)
-            (($# >= 2)) || die "--age requires a value"
-            CLEAN_AGE="$2"
-            shift 2
-            ;;
         --version) echo "remote-run $VERSION"; exit 0 ;;
         -h|--help) usage 0 ;;
         -*)        die "unknown option: $1" ;;
@@ -107,12 +127,13 @@ done
 
 [[ $# -ge 1 ]] || usage 1
 HOST="$1"; shift
+[[ -z "$SCRIPT_FILE" || "$MODE" == "run" ]] \
+    || die "--script is available only when starting a job"
 
 [[ "$SESSION" =~ ^[A-Za-z0-9_-]+$ ]] \
     || die "session names may contain only letters, digits, '_' and '-'"
-if [[ -n "$CLEAN_AGE" && ! "$CLEAN_AGE" =~ ^[0-9]+$ ]]; then
-    die "--age must be a non-negative integer number of hours"
-fi
+[[ "$LOG_RETENTION_DAYS" =~ ^[0-9]+$ ]] \
+    || die "REMOTE_RUN_LOG_RETENTION_DAYS must be a non-negative integer"
 
 # linux.cs.utexas.edu selects a machine from the public pool. remote-run makes
 # several SSH connections, so every invocation must name one concrete host.
@@ -137,6 +158,21 @@ ensure_session() {
         tmux new-window -d -t $SESSION -n $SENTINEL"
 }
 
+# --- List the session's windows: id dead status log name ---
+# The name comes last because a window made outside remote-run may contain
+# spaces; readers take the rest of the line as the name. status is the exit
+# code the job recorded from inside its own pane (see the generated script),
+# falling back to the one tmux reaped, and "-" when neither exists: tmux can
+# leave a finished pane's shell unreaped for hours, reporting no status
+# until an unrelated child exits.
+window_states() {
+    remote "tmux list-windows -t $SESSION -F '#{window_id} #{pane_dead} #{?#{==:#{pane_dead_status},},-,#{pane_dead_status}} #{?#{==:#{@remote_run_exit},},-,#{@remote_run_exit}} #{?#{==:#{@remote_run_log},},-,#{@remote_run_log}} #{window_name}'" \
+        | awk -v sentinel="$SENTINEL" '{
+            status = $4; if ($3 ~ /^[0-9]+$/) status = $3;
+            name = $0; sub(/^([^ ]+ ){5}/, "", name);
+            if (name != sentinel) print $1, $2, status, $5, name }'
+}
+
 # --- Sanitize a string for use as a tmux window name ---
 sanitize_name() {
     local name="$1"
@@ -154,78 +190,263 @@ validate_window_name() {
         || die "window name '$SENTINEL' is reserved"
 }
 
-# --- Clean finished windows in the worker session ---
-# Args: $1 = max age hours (empty = kill any dead window regardless of age)
-#       $2 = "quiet" to suppress per-window output and the 0-kill summary
-#       $3 = status filter: "" (any), "0" (only successful), "nonzero"
-# Returns non-zero if the session doesn't exist on the remote host.
+# --- Print a job's log, from its live window or from the retained file ---
+# Args: $1 = window name, $2 = "full" for the whole log or "exit" for the
+# recorded status: "<status> <log-path>" parsed from the trailer.
+# Returns 1 when neither a window nor a log exists for the name.
+remote_log() {
+    local remote_command
+    printf -v remote_command 'bash -s -- %q %q %q' "$SESSION" "$1" "$2"
+    # shellcheck disable=SC2029 # The pre-quoted argument vector is remote input.
+    ssh "$HOST" "$remote_command" <<'REMOTE_LOG'
+set -euo pipefail
+session=$1
+name=$2
+want=$3
+state_home=${XDG_STATE_HOME:-"$HOME/.local/state"}
+log_dir="$state_home/remote-run/$session"
+
+# A live or unreaped window: read the file its job is writing. Match the
+# name exactly from the listing; display-message with a target it cannot
+# find quietly answers for the current window.
+read -r window_id log < <(tmux list-windows -t "$session" \
+        -F '#{window_id} #{?#{==:#{@remote_run_log},},-,#{@remote_run_log}} #{window_name}' 2>/dev/null \
+    | awk -v n="$name" '{ w = $0; sub(/^([^ ]+ ){2}/, "", w);
+                          if (w == n) { print $1, $2; exit } }'; printf '\n')
+if [[ -n "$window_id" ]]; then
+    if [[ "$want" == exit ]]; then
+        exit 2
+    fi
+    if [[ "$log" != "-" && -f "$log" ]]; then
+        cat -- "$log"
+    else
+        tmux capture-pane -t "$window_id" -p -S -
+    fi
+    exit 0
+fi
+
+# A reaped window: the newest retained log for the name, compressed once the
+# reaper has seen it and plain if it has not.
+shopt -s nullglob
+newest="" newest_stem=""
+for candidate in "$log_dir/$name".*.log.gz "$log_dir/$name".*.log; do
+    stem=${candidate%.gz}
+    stem=${stem%.log}
+    if [[ -z "$newest" || "$stem" > "$newest_stem" ]]; then
+        newest=$candidate
+        newest_stem=$stem
+    fi
+done
+[[ -n "$newest" ]] || exit 1
+if [[ "$newest" == *.gz ]]; then
+    read_log() { gzip -dc -- "$newest"; }
+else
+    read_log() { cat -- "$newest"; }
+fi
+case "$want" in
+    full) read_log ;;
+    exit)
+        status=$(read_log | tail -n 1 \
+            | awk '$1 == "remote-run:" && $2 == "exit" { print $3 }')
+        printf '%s %s\n' "${status:--}" "$newest"
+        ;;
+esac
+REMOTE_LOG
+}
+
+# --- Reap finished windows, compress orphaned logs, prune old ones ---
+# Args: $1 = "quiet" to print only a nonzero summary. Every dead window with
+# a recorded exit status is removed, whatever the status: its output is in
+# its log. Then every log in the session directory that no window claims is
+# gzipped, and logs older than the retention are deleted from every session.
+# Returns non-zero if the session is absent or a finished window had to be
+# kept because its status is unavailable.
 do_clean() {
-    local age_hours="$1"
-    local mode="${2:-}"
-    local only_status="${3:-}"
-    local dead_windows now killed=0 window_id dead dead_time dead_status name
+    local mode="${1:-}"
+    local remote_command result kind status name
+    local reaped=0 compressed=0 pruned=0 retained=0
 
-    dead_windows=$(remote "tmux list-windows -t $SESSION \
-        -F '#{window_id} #{pane_dead} #{pane_dead_time} #{pane_dead_status} #{window_name}'" \
-        2>/dev/null) || return 1
-    now=$(remote "date +%s")
+    printf -v remote_command 'bash -s -- %q %q' "$SESSION" "$LOG_RETENTION_DAYS"
+    # shellcheck disable=SC2029 # The pre-quoted argument vector is remote input.
+    result=$(ssh "$HOST" "$remote_command" <<'REMOTE_REAP'
+set -euo pipefail
+session=$1
+retention_days=$2
+state_home=${XDG_STATE_HOME:-"$HOME/.local/state"}
+log_root="$state_home/remote-run"
+log_dir="$log_root/$session"
 
-    while read -r window_id dead dead_time dead_status name; do
-        [[ "$window_id" =~ ^@[0-9]+$ ]] || continue
-        [[ "$dead" == "1" ]] || continue
+tmux has-session -t "$session" 2>/dev/null || exit 3
 
-        case "$only_status" in
-            0)       [[ "$dead_status" == "0" ]] || continue ;;
-            nonzero) [[ "$dead_status" != "0" ]] || continue ;;
+# Reap. The recorded status is preferred to tmux's: see window_states.
+while read -r window_id dead dead_status recorded name; do
+    [[ "$dead" == "1" ]] || continue
+    status=$recorded
+    [[ "$dead_status" =~ ^[0-9]+$ ]] && status=$dead_status
+    if [[ ! "$status" =~ ^[0-9]+$ ]]; then
+        printf 'retained - %s\n' "$name"
+        continue
+    fi
+    if tmux kill-window -t "$window_id"; then
+        printf 'reaped %s %s\n' "$status" "$name"
+    else
+        printf 'retained - %s\n' "$name"
+    fi
+done < <(tmux list-windows -t "$session" \
+    -F '#{window_id} #{pane_dead} #{?#{==:#{pane_dead_status},},-,#{pane_dead_status}} #{?#{==:#{@remote_run_exit},},-,#{@remote_run_exit}} #{window_name}')
+
+# Compress every log no surviving window claims: reaped, killed, or orphaned
+# by a tmux server that died. A running job's log is claimed before its
+# first byte is written, so a live log is never compressed under it.
+shopt -s nullglob
+claimed=$(tmux list-windows -t "$session" -F '#{@remote_run_log}')
+for log in "$log_dir"/*.log; do
+    [[ -f "$log" && ! -L "$log" ]] || continue
+    grep -Fxq -- "$log" <<< "$claimed" && continue
+    if gzip -f -- "$log"; then
+        printf 'compressed - %s.gz\n' "$log"
+    else
+        printf 'warning: could not compress %s\n' "$log" >&2
+    fi
+done
+
+# Prune reaped logs past the retention.
+if [[ -d "$log_root" ]]; then
+    while read -r old; do
+        rm -f -- "$old" && printf 'pruned - %s\n' "$old"
+    done < <(find "$log_root" -name '*.log.gz' -type f \
+        -mmin "+$((retention_days * 1440))" -print)
+fi
+REMOTE_REAP
+    ) || {
+        (( $? == 3 )) && return 1
+        echo "warning: reaping finished windows on $HOST did not complete" >&2
+    }
+
+    while read -r kind status name; do
+        case "$kind" in
+            reaped)
+                reaped=$((reaped + 1))
+                [[ "$mode" != "quiet" ]] && echo "Reaped $name (exit $status)"
+                ;;
+            retained)
+                retained=$((retained + 1))
+                echo "warning: retained finished window $name with unavailable exit status" >&2
+                ;;
+            compressed) compressed=$((compressed + 1)) ;;
+            pruned) pruned=$((pruned + 1)) ;;
         esac
-
-        if [[ -n "$age_hours" && -n "$dead_time" && "$dead_time" != "0" ]]; then
-            local age_secs=$(( now - dead_time ))
-            local threshold_secs=$(( age_hours * 3600 ))
-            (( age_secs < threshold_secs )) && continue
-        fi
-
-        # </dev/null: ssh would otherwise consume the loop's here-string
-        # stdin, ending the while-read after a single iteration.
-        if remote "tmux kill-window -t $window_id" \
-                </dev/null 2>/dev/null; then
-            [[ "$mode" != "quiet" ]] && echo "Killed $name"
-            killed=$((killed + 1))
-        fi
-    done <<< "$dead_windows"
+    done <<< "$result"
 
     if [[ "$mode" == "quiet" ]]; then
-        (( killed > 0 )) && echo "Auto-cleaned $killed successful window(s) on $HOST"
+        (( reaped > 0 )) && echo "Reaped $reaped finished window(s) on $HOST"
     else
-        echo "Cleaned $killed finished window(s) on $HOST"
+        echo "Reaped $reaped finished window(s) on $HOST"
     fi
-    return 0
+    (( compressed > 0 )) && echo "Compressed $compressed log(s) on $HOST"
+    (( pruned > 0 )) \
+        && echo "Pruned $pruned log(s) older than $LOG_RETENTION_DAYS days on $HOST"
+    (( retained == 0 ))
+}
+
+# --- The script that runs in the pane ---
+# Uses INNER, QUOTED_CMD, SESSION, WINDOW_NAME. Local expansion is intentional
+# for those; every \$ is a variable the host evaluates. The script enables
+# remain-on-exit and claims its log from inside its own pane before user code
+# can run, so a millisecond job is never reaped statusless or its log
+# compressed under it. It then deletes itself. The job runs in a subshell
+# piped through tee so the pane shows its output while the log keeps it, and
+# its exit status is recorded on the window afterwards, from inside the pane,
+# because tmux fills pane_dead_status only once it reaps the shell.
+generated_script() {
+    cat <<REMOTESCRIPT
+#!/usr/bin/env bash
+tmux set-option -w -t "\$TMUX_PANE" remain-on-exit on
+rm -f -- "\$0"
+export PATH="\$HOME/.local/bin:\$HOME/bin:\$PATH"
+umask 077
+remote_run_log_dir=\${XDG_STATE_HOME:-\$HOME/.local/state}/remote-run/$SESSION
+mkdir -p "\$remote_run_log_dir"
+remote_run_log=\$remote_run_log_dir/$WINDOW_NAME.\$(date +%s).log
+tmux set-option -w -t "\$TMUX_PANE" @remote_run_log "\$remote_run_log"
+{
+    printf 'remote-run: start %s host=%s session=%s window=%s\\n' \\
+        "\$(date -u +%Y-%m-%dT%H:%M:%SZ)" "\$(hostname)" $SESSION $WINDOW_NAME
+    printf 'remote-run: command %s\\n' $QUOTED_CMD
+} > "\$remote_run_log"
+(
+$INNER
+) 2>&1 | tee -a "\$remote_run_log"
+remote_run_status=\${PIPESTATUS[0]}
+printf 'remote-run: exit %s %s\\n' "\$remote_run_status" \\
+    "\$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "\$remote_run_log"
+tmux set-option -w -t "\$TMUX_PANE" @remote_run_exit "\$remote_run_status"
+exit "\$remote_run_status"
+REMOTESCRIPT
 }
 
 case "$MODE" in
     run)
-        [[ $# -ge 1 ]] || die "no command specified"
-        if (($# == 1)); then
-            # A single argument is an intentional shell expression, allowing
-            # pipelines and redirections as shown in the course examples.
-            CMD="$1"
-        else
-            # Multiple arguments are argv: preserve their boundaries rather
-            # than flattening quoted arguments before they reach the host.
-            printf -v CMD '%q ' "$@"
+        if [[ -n "$SCRIPT_FILE" ]]; then
+            [[ -f "$SCRIPT_FILE" && -r "$SCRIPT_FILE" ]] \
+                || die "script file is missing or unreadable: $SCRIPT_FILE"
+            first_line=""
+            IFS= read -r first_line < "$SCRIPT_FILE" || true
+            if [[ "$first_line" == '#!'* ]]; then
+                read -r -a shebang_words <<< "${first_line:2}"
+                interpreter="${shebang_words[0]:-}"
+                interpreter="${interpreter##*/}"
+                if [[ "$interpreter" == env ]]; then
+                    interpreter="${shebang_words[1]:-}"
+                    if [[ "$interpreter" == -S ]]; then
+                        interpreter="${shebang_words[2]:-}"
+                    fi
+                fi
+                [[ "$interpreter" == bash || "$interpreter" == sh ]] \
+                    || die "script shebang must use bash or sh: $SCRIPT_FILE"
+            fi
+            printf -v CMD '%q ' "$SCRIPT_FILE" "$@"
             CMD="${CMD% }"
+            # Explicitly reset positional parameters even for zero arguments.
+            # The file body is expanded into the generated bash script only
+            # once, so its shell syntax is not evaluated by the local shell.
+            SCRIPT_ARGV=""
+            if (($# > 0)); then
+                printf -v SCRIPT_ARGV '%q ' "$@"
+                SCRIPT_ARGV="${SCRIPT_ARGV% }"
+            fi
+            INNER="set -- $SCRIPT_ARGV
+$(cat -- "$SCRIPT_FILE")"
+        else
+            [[ $# -ge 1 ]] || die "no command specified"
+            if (($# == 1)); then
+                # A single argument is an intentional shell expression,
+                # allowing pipelines and redirections in course examples.
+                CMD="$1"
+            else
+                # Multiple arguments are argv: preserve their boundaries.
+                printf -v CMD '%q ' "$@"
+                CMD="${CMD% }"
+            fi
         fi
 
-        # Derive window name from command if not specified
+        # Derive window name from the script or command if not specified.
         if [[ -z "$WINDOW_NAME" ]]; then
-            # Use first meaningful word of the command
-            WINDOW_NAME=$(sanitize_name "$(echo "$CMD" | awk '{print $1}')")
+            if [[ -n "$SCRIPT_FILE" ]]; then
+                script_name="${SCRIPT_FILE##*/}"
+                WINDOW_NAME=$(sanitize_name "${script_name%.*}")
+            else
+                # Use first meaningful word of the command.
+                WINDOW_NAME=$(sanitize_name "$(echo "$CMD" | awk '{print $1}')")
+            fi
         fi
         validate_window_name "$WINDOW_NAME"
 
         # Build the inner command. Quote --cd as remote shell data; preserve
         # the documented ~/ spelling by expanding it through remote $HOME.
-        INNER="$CMD"
+        if [[ -z "$SCRIPT_FILE" ]]; then
+            INNER="$CMD"
+        fi
         if [[ -n "$CD_DIR" ]]; then
             if [[ "$CD_DIR" == "~" ]]; then
                 # shellcheck disable=SC2016 # Expand HOME on the remote host.
@@ -236,8 +457,12 @@ case "$MODE" in
             else
                 printf -v QUOTED_CD '%q' "$CD_DIR"
             fi
-            INNER="cd $QUOTED_CD && $INNER"
+            # On its own line so a failed cd ends the job, rather than only
+            # the first command of a `;`-joined line.
+            INNER="cd $QUOTED_CD || exit
+$INNER"
         fi
+        QUOTED_CMD=$(printf '%q' "$CMD")
 
         # --- Dry-run: show what would be sent and exit ---
         if $DRY_RUN; then
@@ -246,23 +471,15 @@ case "$MODE" in
             echo "Window:  $WINDOW_NAME"
             echo "Script:  ~/.remote-run-${SESSION}-${WINDOW_NAME}.XXXXXX"
             echo "--- generated script ---"
-            echo '#!/usr/bin/env bash'
-            # shellcheck disable=SC2016 # Print remote expansion literally.
-            echo 'tmux set-option -w -t "$TMUX_PANE" remain-on-exit on'
-            echo "rm -f ~/\$(basename \"\$0\")"
-            # shellcheck disable=SC2016 # Print remote expansion literally.
-            echo 'export PATH="$HOME/.local/bin:$HOME/bin:$PATH"'
-            echo "$INNER"
+            generated_script
             echo "--- end ---"
             exit 0
         fi
 
         ensure_session
 
-        # Auto-clean: reap successful (exit 0) dead windows so the worker
-        # session doesn't accumulate cruft. Failed windows are preserved
-        # for debugging — nuke those with an explicit `remote-run --clean`.
-        do_clean "" quiet 0 || true
+        # Reap finished windows and prune old logs before adding a window.
+        do_clean quiet || true
 
         # Write the command to a temporary script on the remote host, then
         # have tmux run it via bash -l. This sidesteps all nested quoting
@@ -276,13 +493,7 @@ case "$MODE" in
             && "$SCRIPT_PATH" != *$'\n'* ]] \
             || die "remote mktemp returned an unsafe path"
         printf -v QUOTED_SCRIPT '%q' "$SCRIPT_PATH"
-        remote "cat > $QUOTED_SCRIPT" <<REMOTESCRIPT
-#!/usr/bin/env bash
-tmux set-option -w -t "\$TMUX_PANE" remain-on-exit on
-rm -f -- "\$0"
-export PATH="\$HOME/.local/bin:\$HOME/bin:\$PATH"
-$INNER
-REMOTESCRIPT
+        generated_script | remote "cat > $QUOTED_SCRIPT"
         set +e
         remote "lock=\$HOME/.remote-run-${SESSION}-${WINDOW_NAME}.lock; \
             if ! mkdir \"\$lock\" 2>/dev/null; then exit 75; fi; \
@@ -307,25 +518,47 @@ REMOTESCRIPT
         fi
 
         echo "Started on $HOST in $SESSION:$WINDOW_NAME"
-        echo "  Check:  remote-run --check $HOST $WINDOW_NAME"
-        echo "  Log:    remote-run --log $HOST $WINDOW_NAME"
-        echo "  Attach: remote-run --attach $HOST $WINDOW_NAME"
+        SESSION_OPTION=""
+        if [[ "$SESSION" != "worker" ]]; then
+            SESSION_OPTION="--session $SESSION "
+        fi
+        echo "  Check:  remote-run ${SESSION_OPTION}--check $HOST $WINDOW_NAME"
+        echo "  Log:    remote-run ${SESSION_OPTION}--log $HOST $WINDOW_NAME"
+        echo "  Attach: remote-run ${SESSION_OPTION}--attach $HOST $WINDOW_NAME"
         ;;
 
     check)
         [[ $# -ge 1 ]] || die "no window name specified"
         WINDOW_NAME="$1"
         validate_window_name "$WINDOW_NAME"
-        STATUS=$(remote "tmux display-message \
-            -t $SESSION:$(printf '%q' "$WINDOW_NAME") \
-            -p '#{pane_dead} #{pane_dead_status}'" 2>/dev/null) \
-            || die "window '$WINDOW_NAME' not found in session '$SESSION'"
+        # Match the name exactly from the listing: display-message with a
+        # target it cannot find quietly answers for the current window.
+        STATUS=$(window_states 2>/dev/null \
+            | awk -v name="$WINDOW_NAME" '{ w = $0; sub(/^([^ ]+ ){4}/, "", w);
+                                            if (w == name) print $2, $3 }')
+        if [[ -z "$STATUS" ]]; then
+            # Reaped, perhaps: the retained log ends with the status.
+            if RETAINED=$(remote_log "$WINDOW_NAME" exit 2>/dev/null); then
+                read -r EXIT_CODE LOG_PATH <<< "$RETAINED"
+                if [[ ! "$EXIT_CODE" =~ ^[0-9]+$ ]]; then
+                    echo "Finished (exit status unavailable), reaped; log $LOG_PATH"
+                elif [[ "$EXIT_CODE" == "0" ]]; then
+                    echo "Finished (exit 0), reaped; log $LOG_PATH"
+                else
+                    echo "Failed (exit $EXIT_CODE), reaped; log $LOG_PATH"
+                fi
+                exit 0
+            fi
+            die "window '$WINDOW_NAME' not found in session '$SESSION', and no log retained"
+        fi
 
         DEAD=$(echo "$STATUS" | awk '{print $1}')
         EXIT_CODE=$(echo "$STATUS" | awk '{print $2}')
 
         if [[ "$DEAD" == "1" ]]; then
-            if [[ "$EXIT_CODE" == "0" ]]; then
+            if [[ ! "$EXIT_CODE" =~ ^[0-9]+$ ]]; then
+                echo "Finished (exit status unavailable)"
+            elif [[ "$EXIT_CODE" == "0" ]]; then
                 echo "Finished (exit 0)"
             else
                 echo "Failed (exit $EXIT_CODE)"
@@ -339,9 +572,8 @@ REMOTESCRIPT
         [[ $# -ge 1 ]] || die "no window name specified"
         WINDOW_NAME="$1"
         validate_window_name "$WINDOW_NAME"
-        remote "tmux capture-pane \
-            -t $SESSION:$(printf '%q' "$WINDOW_NAME") -p -S -" 2>/dev/null \
-            || die "window '$WINDOW_NAME' not found in session '$SESSION'"
+        remote_log "$WINDOW_NAME" full \
+            || die "window '$WINDOW_NAME' not found in session '$SESSION', and no log retained"
         ;;
 
     attach)
@@ -359,23 +591,22 @@ REMOTESCRIPT
         WINDOW_NAME="$1"
         validate_window_name "$WINDOW_NAME"
         remote "tmux kill-window \
-            -t $SESSION:$(printf '%q' "$WINDOW_NAME")" 2>/dev/null \
+            -t $SESSION:=$(printf '%q' "$WINDOW_NAME")" 2>/dev/null \
             || die "window '$WINDOW_NAME' not found in session '$SESSION'"
         echo "Killed $SESSION:$WINDOW_NAME on $HOST"
         ;;
 
     list)
-        remote "tmux has-session -t $SESSION 2>/dev/null || exit 1; \
-            tmux list-windows -t $SESSION \
-            -F '#{window_name}  \
-#{?pane_dead,(done exit #{pane_dead_status}),running}' | \
-            grep -v '^$SENTINEL  ' || true" \
+        window_states 2>/dev/null \
+            | awk '{ name = $0; sub(/^([^ ]+ ){4}/, "", name);
+                     if ($2 == "1") printf "%s  (done exit %s)\n", name, $3;
+                     else printf "%s  running\n", name }' \
             || die "session '$SESSION' not found on $HOST"
         ;;
 
     clean)
-        # Kill all finished (pane_dead=1) windows. With --age HOURS, only
-        # kill windows whose pane has been dead longer than HOURS hours.
-        do_clean "$CLEAN_AGE" || die "session '$SESSION' not found on $HOST"
+        # Reap every finished window with a recorded status and prune logs.
+        do_clean \
+            || die "one or more finished windows could not be reaped on $HOST"
         ;;
 esac

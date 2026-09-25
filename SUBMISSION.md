@@ -7,7 +7,6 @@ remaining disclosure fields when they apply or when they would help the grader.
 - EID:
 - Email:
 - Hours spent on this assignment:
-- Slip days used:
 - Collaborators (people you discussed the work with):
 - Comments (known issues, anything else the grader should know):
 

@@ -87,6 +87,27 @@ ssh "$HOST" 'cd ~/project && git pull --rebase'
 remote-run --cd '~/project' --name tests "$HOST" 'uv run pytest -x'
 ```
 
+For a multiline job, write a local bash or sh file and pass its arguments after
+the host. `remote-run` reads the file on the laptop and runs its contents in the
+remote job; the file itself need not exist on the host.
+
+```bash
+cat > run-checks.sh <<'SH'
+#!/usr/bin/env bash
+set -e
+printf 'Checking %s\n' "$1"
+uv run pytest -x "$1"
+SH
+remote-run --cd '~/project' --name focused \
+    --script run-checks.sh "$HOST" 'tests/test cli.py'
+```
+
+The first argument after `HOST` becomes `$1` in the script, the next becomes
+`$2`, and so on. Quoted arguments keep their boundaries. With no arguments,
+the script starts with zero positional parameters. Scripts without a shebang
+also run under bash; a shebang naming an interpreter other than bash or sh is
+rejected before dispatch.
+
 The launch prints the exact follow-up commands. They remain usable after the
 laptop sleeps or changes networks:
 
@@ -98,6 +119,11 @@ remote-run --list "$HOST"
 remote-run --clean "$HOST"
 ```
 
-Successful windows are cleaned automatically on the next launch. Failed
-windows stay available for inspection until you clean or kill them. Always
-record the exact host and window name in a handoff.
+A job's output is written to a log on the host as it runs, under
+`~/.local/state/remote-run/`, ending with the exit status. Every launch and
+`--clean` reap the finished windows, successful or failed, and compress their
+logs; `--log` and `--check` keep reading the log after the window is gone, and
+logs are deleted after 30 days. Because the department home is shared, the
+same log directory is visible from every host; the log's first line names the
+host the job ran on. Always record the exact host and window name in a
+handoff.

@@ -19,6 +19,7 @@ import sys
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, date, datetime
+from io import TextIOWrapper
 from pathlib import Path
 from typing import Literal, cast
 
@@ -302,6 +303,7 @@ def _git(repo: Path, *args: str, check: bool = True) -> str:
         check=False,
         capture_output=True,
         text=True,
+        encoding="utf-8",
     )
     if check and completed.returncode != 0:
         raise ReviewError(completed.stderr.strip() or f"git {' '.join(args)} failed")
@@ -429,7 +431,7 @@ def _save_state(root: Path, state: ReviewState) -> None:
     path = _state_path(root, state.session)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(asdict(state), indent=2) + "\n")
+    temporary.write_text(json.dumps(asdict(state), indent=2) + "\n", encoding="utf-8")
     temporary.replace(path)
 
 
@@ -438,7 +440,7 @@ def _load_state(root: Path, reviewer: Reviewer, session: str | None) -> ReviewSt
         active = root / ".active"
         if not active.exists():
             raise ReviewError(f"no active {reviewer} review session")
-        session = active.read_text().strip()
+        session = active.read_text(encoding="utf-8").strip()
     if not session or sanitize_name(session) != session:
         raise ReviewError(
             "invalid session name; use letters, digits, '.', '_', or '-'"
@@ -446,7 +448,7 @@ def _load_state(root: Path, reviewer: Reviewer, session: str | None) -> ReviewSt
     path = _state_path(root, session)
     if not path.exists():
         raise ReviewError(f"{reviewer} review session not found: {session}")
-    raw = cast(dict[str, object], json.loads(path.read_text()))
+    raw = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
     stored_reviewer = cast(Reviewer, raw["reviewer"])
     if stored_reviewer != reviewer:
         raise ReviewError(
@@ -507,10 +509,10 @@ def _review_command(reviewer: Reviewer) -> list[str]:
 
 
 def _truncate_tracked_diff(diff: str) -> str:
-    encoded = diff.encode()
+    encoded = diff.encode("utf-8")
     if len(encoded) <= MAX_TRACKED_DIFF_BYTES:
         return diff
-    prefix = encoded[:MAX_TRACKED_DIFF_BYTES].decode(errors="replace")
+    prefix = encoded[:MAX_TRACKED_DIFF_BYTES].decode("utf-8", errors="replace")
     omitted = len(encoded) - MAX_TRACKED_DIFF_BYTES
     return f"{prefix}\n[tracked diff truncated: {omitted} bytes omitted]"
 
@@ -533,7 +535,7 @@ def _read_untracked(path: Path, byte_limit: int) -> tuple[str, int]:
     truncated = len(data) > limit
     data = data[:limit]
     try:
-        content = data.decode()
+        content = data.decode("utf-8")
     except UnicodeDecodeError:
         return "[binary file omitted]", len(data)
     if truncated:
@@ -583,7 +585,7 @@ def _refresh_code_snapshot(
         content, consumed = _read_untracked(path, remaining)
         remaining -= consumed
         parts.append(f"# Untracked file: {relative}\n{content}")
-    diff_path.write_text("\n\n".join(parts).rstrip() + "\n")
+    diff_path.write_text("\n\n".join(parts).rstrip() + "\n", encoding="utf-8")
     provenance = "; ".join(line.removeprefix("# ") for line in provenance_lines)
     return (
         replace(
@@ -614,6 +616,7 @@ def _run_ask(state: ReviewState, prompt: Path, output: Path) -> str | None:
         check=False,
         capture_output=True,
         text=True,
+        encoding="utf-8",
     )
     if completed.returncode != 0:
         detail = (
@@ -624,7 +627,7 @@ def _run_ask(state: ReviewState, prompt: Path, output: Path) -> str | None:
         if (
             RESPONSE_COMPLETE_MARKER in completed.stderr
             and output.is_file()
-            and output.read_text().strip()
+            and output.read_text(encoding="utf-8").strip()
         ):
             return (
                 "review completed but its session was not registered; "
@@ -633,7 +636,7 @@ def _run_ask(state: ReviewState, prompt: Path, output: Path) -> str | None:
                 f"bridge detail: {detail}"
             )
         raise ReviewError(f"{state.reviewer}-ask failed: {detail}")
-    if not output.is_file() or not output.read_text().strip():
+    if not output.is_file() or not output.read_text(encoding="utf-8").strip():
         raise ReviewError(f"{state.reviewer}-ask produced no review response")
     return None
 
@@ -664,23 +667,25 @@ def _invoke_round(
             memo,
             diff_path,
             snapshot_provenance,
-        )
+        ),
+        encoding="utf-8",
     )
     bridge_warning = _run_ask(state, prompt, response)
     try:
-        findings = parse_findings(response.read_text())
+        findings = parse_findings(response.read_text(encoding="utf-8"))
     except ReviewError:
         repair_prompt = phase_dir / f"round{state.round}-repair.prompt.md"
         repair_response = phase_dir / f"round{state.round}-repair.response.md"
         repair_prompt.write_text(
             "Reformat the previous response into the exact finding contract in "
             f"{prompt}. Preserve its substance and output no extra prose.\n\n"
-            f"Previous response:\n{response.read_text()}"
+            f"Previous response:\n{response.read_text(encoding='utf-8')}",
+            encoding="utf-8",
         )
         repair_warning = _run_ask(state, repair_prompt, repair_response)
         bridge_warning = bridge_warning or repair_warning
         try:
-            findings = parse_findings(repair_response.read_text())
+            findings = parse_findings(repair_response.read_text(encoding="utf-8"))
         except ReviewError as error:
             raise ReviewError(
                 "review response format is invalid after one repair attempt; "
@@ -757,7 +762,7 @@ def _start(args: argparse.Namespace) -> None:
         prepared_snapshot = _refresh_code_snapshot(root, state)
         state = prepared_snapshot[0]
     root.mkdir(parents=True, exist_ok=True)
-    (root / ".active").write_text(session + "\n")
+    (root / ".active").write_text(session + "\n", encoding="utf-8")
     _save_state(root, state)
     state = _invoke_round(root, state, prepared_snapshot=prepared_snapshot)
     print(f"{reviewer}/{state.session}: {state.phase} round 1 -> {state.response}")
@@ -771,12 +776,12 @@ def _continue(args: argparse.Namespace) -> None:
         raise ReviewError("review phase is limited to three rounds")
     if state.response is None:
         raise ReviewError("current round has no response")
-    findings = parse_findings(Path(state.response).read_text())
+    findings = parse_findings(Path(state.response).read_text(encoding="utf-8"))
     override = cast(str | None, args.override_premise)
     memo_path = Path(cast(str, args.memo)).resolve()
     if not memo_path.is_file():
         raise ReviewError(f"disposition memo is not a file: {memo_path}")
-    memo = memo_path.read_text()
+    memo = memo_path.read_text(encoding="utf-8")
     require_premise_override(findings, _memo_assignments(memo), override)
     validate_memo(
         memo,
@@ -784,10 +789,10 @@ def _continue(args: argparse.Namespace) -> None:
         premise_override=bool(override and override.strip()),
     )
     phase_dir = root / state.session / state.phase
-    (phase_dir / f"round{state.round}.memo.md").write_text(memo)
+    (phase_dir / f"round{state.round}.memo.md").write_text(memo, encoding="utf-8")
     if override:
         (phase_dir / f"round{state.round}.premise-override.txt").write_text(
-            override.strip() + "\n"
+            override.strip() + "\n", encoding="utf-8"
         )
     state = replace(
         state,
@@ -830,7 +835,7 @@ def _retry(args: argparse.Namespace) -> None:
             raise ReviewError(
                 f"cannot retry without prior disposition memo: {memo_path}"
             )
-        memo = memo_path.read_text()
+        memo = memo_path.read_text(encoding="utf-8")
     state = _invoke_round(root, state, memo)
     print(
         f"{reviewer}/{state.session}: {state.phase} round {state.round} "
@@ -848,7 +853,7 @@ def _close_current_round(
 ) -> ReviewState:
     if state.response is None:
         raise ReviewError("current round has no response; retry it before close")
-    findings = parse_findings(Path(state.response).read_text())
+    findings = parse_findings(Path(state.response).read_text(encoding="utf-8"))
     if not findings:
         return replace(
             state,
@@ -863,7 +868,7 @@ def _close_current_round(
     memo_path = Path(memo_value).resolve()
     if not memo_path.is_file():
         raise ReviewError(f"disposition memo is not a file: {memo_path}")
-    memo = memo_path.read_text()
+    memo = memo_path.read_text(encoding="utf-8")
     require_premise_override(findings, _memo_assignments(memo), override)
     validate_closing_memo(
         memo,
@@ -871,10 +876,10 @@ def _close_current_round(
         premise_override=bool(override and override.strip()),
     )
     phase_dir = root / state.session / state.phase
-    (phase_dir / f"round{state.round}.memo.md").write_text(memo)
+    (phase_dir / f"round{state.round}.memo.md").write_text(memo, encoding="utf-8")
     if override:
         (phase_dir / f"round{state.round}.premise-override.txt").write_text(
-            override.strip() + "\n"
+            override.strip() + "\n", encoding="utf-8"
         )
     return replace(
         state,
@@ -944,7 +949,10 @@ def _finish(args: argparse.Namespace) -> None:
     state = replace(state, statuses=statuses)
     _save_state(root, state)
     active = root / ".active"
-    if active.exists() and active.read_text().strip() == state.session:
+    if (
+        active.exists()
+        and active.read_text(encoding="utf-8").strip() == state.session
+    ):
         active.unlink()
     print(f"{reviewer}/{state.session}: complete")
 
@@ -1003,6 +1011,9 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    for stream in (sys.stdout, sys.stderr):
+        if isinstance(stream, TextIOWrapper):
+            stream.reconfigure(encoding="utf-8")
     try:
         args = _parser().parse_args()
         handler = cast(object, args.handler)

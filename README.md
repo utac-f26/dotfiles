@@ -34,11 +34,13 @@ with `gh auth login` before running the completion check.
 The installer is no-root by construction. It installs tools under `~/.local`,
 adds `~/.local/bin` and `~/bin` to your shell PATH once, creates an age key if
 one does not exist, writes `.sops.yaml` for your public age recipient, links the
-owned Claude settings and shared agent guidance, and seeds Codex's live config
-on a new machine. It also configures the course template as the source for
-`git pull` while keeping your personal repository as the destination for
+owned Claude settings, Codex hooks, and shared agent guidance, and seeds
+Codex's live config on a new machine. It makes the course template the source
+for `git pull` while keeping your personal repository as the destination for
 `git push`; setup rejects a checkout whose `origin` is the public course
-repository. Directly downloaded tools use explicit release versions and
+repository. It installs the repository's Git hooks from `hooks/`, which is how
+`git commit` refuses a setup receipt that no longer matches the files being
+committed (see Completion). Directly downloaded tools use explicit release versions and
 repository-owned SHA-256 checksums; Claude Code, Codex, Ruff, and Pyright are
 pinned as well. `tool-versions.txt` defines compatibility: setup keeps an
 existing managed tool only when `--version` reports the same major and at least
@@ -84,6 +86,8 @@ The files have deliberately narrow roles:
   `~/.claude` and `~/.codex`.
 - `claude/CLAUDE.md` imports that adjacent guidance and is the place for future
   Claude-only instructions. `claude/settings.json` is portable and linked.
+- `codex/hooks.json` is the linked Codex session-hook configuration. Review it
+  when Codex asks you to trust the hooks, then choose "Trust all and continue."
 - `codex/config.seed.toml` contains stable defaults. `./links` copies it only
   when `~/.codex/config.toml` is absent; after that, Codex owns the live file.
 - `.tmux.conf` is the portable tmux policy linked as `~/.tmux.conf`.
@@ -95,6 +99,39 @@ The files have deliberately narrow roles:
 Edit each setting at its owner instead of repeating it in multiple client
 files. Runtime auth, transcripts, caches, and one-machine overrides stay
 outside this repository.
+
+## File provenance for course work
+
+Course homework repositories include `agent_usage.py`. Its Git hooks record
+file provenance with each commit. The course dotfiles' `agent-log-keeper`
+preserves Claude Code and Codex session logs privately on your machine so the
+record can still be made after an agent rotates its own logs. Claude Code's
+`cleanupPeriodDays` is set to 120; keep your logs until the course ends and do
+not delete Codex sessions. Existing dotfiles installations must run `./links`
+after this update to link the new Codex hooks. Review `codex/hooks.json` and
+approve the trust prompt in Codex yourself.
+
+Before submitting course work, run this from the homework repository root:
+
+```bash
+uv run --script agent_usage.py
+```
+
+Read its local findings and commit the required
+`transcripts/usage-<machine>.jsonl` record. Each partner runs the command on
+their own machine. Every document your agent reads for the homework must be in
+the kit or committed to the repository. Installed dependencies and runtime
+agent settings may stay outside it. Commit assignment guidance documents.
+Never commit secrets.
+
+The record contains usage counts, fingerprints of agent-read material,
+repository-relative paths for unexplained files, coverage, and collection
+errors. It contains no raw prompts, replies, file contents, commands, or paths
+outside the repository. A fingerprint can confirm guessed or known text, but
+does not reversibly encode a document. Raw logs remain in private local state;
+donating a full transcript is a separate, optional choice in a homework
+writeup. The Git hooks do not block a commit if collection fails, so read the
+manual command's error report before submission.
 
 ## Cheap `/clear` restarts in Claude Code
 
@@ -240,15 +277,31 @@ git commit -m 'complete dotfiles setup'
 git push
 ```
 
+That is one commit on purpose. The receipt binds SHA-256 digests of
+`SUBMISSION.md`, `AGENTS.md`, `claude/settings.json`, and
+`codex/config.seed.toml`, and we grade those four files at the commit that
+carries the receipt — so commit them together, and then go on using the
+repository. Later changes land on later commits and leave your submission alone;
+rerun `./self-check` and commit the new receipt whenever you want to re-pin it.
+Do not rewrite pushed history on `main`, which would delete the commit your
+grade refers to.
+
+`git commit` runs `hooks/pre-commit` whenever the receipt is staged. It refuses
+the commit if any of the four bound files differs from the copy `self-check`
+certified — an edit made after the check, or a checked file that was never
+`git add`ed — and names the file. Stage the copy you checked, or rerun
+`./self-check` and stage the new receipt. A receipt that reaches `main`
+therefore certifies the files beside it.
+
 If `self-check` fails, read the failing check and fix that item. The receipt is
 written only when the required checks pass. It records the normalized path and
 non-empty version output for every required command, so `remote-run` and
 `with-secrets` must be invokable by name rather than merely present in this
 checkout. It also records successful GitHub and Codex authentication. Nothing
-is uploaded on Canvas; your repository's `main` branch is the submission, and
-it must also contain your reviewed agent commit to `AGENTS.md`. The receipt
-also records the `KIT_REV`, the managed-link contract, and the pull/push
-routing.
+is uploaded on Canvas; the commit on your `main` branch that carries the receipt
+is the submission, and it must also contain your reviewed agent commit to
+`AGENTS.md`. The receipt also records the `KIT_REV`, the managed-link contract,
+and the pull/push routing.
 
 After the receipt, `self-check` also reports what is left of the homework
 itself: a `TODO` line for each unfilled required identity/effort field, each

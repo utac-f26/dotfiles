@@ -31,7 +31,17 @@ Do not infer that two paths are redundant merely because their code looks
 similar. Establish whether they provide different security, lifecycle,
 transactional, compatibility, or performance guarantees.
 
+Fix the scope before the inventory. Use the files or subsystems the user
+named. For a whole-repository request, pick the area with the most duplicated
+mechanisms or the most recent churn, name the packages or files it covers
+before editing, and hold it. Findings outside that boundary go in the report
+as follow-ups. The pass ends when the in-scope inventory is exhausted or every
+remaining item fails a calibration test.
+
 ## Inventory Before Editing
+
+Read [references/calibration.md](references/calibration.md) first. Its tests
+separate real fixes from churn and help decide what belongs in the inventory.
 
 Trace definitions through callers and tests. Look for:
 
@@ -48,6 +58,11 @@ Trace definitions through callers and tests. Look for:
   effects, or unclear thread/process safety.
 - Tests that repeat large internally constrained objects or assert incidental
   implementation details instead of portable contracts.
+
+Order the inventory before editing: consolidation of duplicate mechanisms and
+real defects first, typing and API-scope changes second, naming and comment
+fixes last. Work in that order so a pass cut short by budget or a failing gate
+has already made the highest-value changes.
 
 Choose the implementation with the strongest contract and clearest ownership
 as the canonical mechanism. Migrate all in-scope callers and delete the old
