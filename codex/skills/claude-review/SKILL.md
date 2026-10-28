@@ -57,7 +57,7 @@ once and no unknown finding.
 - #3
 ```
 
-Then run:
+When another round is needed, run:
 
 ```bash
 claude-review continue --memo PATH
@@ -71,10 +71,22 @@ the premise, put it under Pushing back and record the decision explicitly:
 claude-review continue --memo PATH --override-premise "USER REASON"
 ```
 
-Never invent an override or edit reviewer response files. Normally run two
-rounds. Use the third only when round two reports a new or unresolved issue.
-Each memo bullet starts with its finding number; numbers later in explanatory
-text, such as `PR #7`, are not dispositions.
+Never invent an override or edit reviewer response files. Each memo bullet
+starts with its finding number; numbers later in explanatory text, such as
+`PR #7`, are not dispositions.
+
+## When to stop
+
+BLOCKER means a concrete defect, missing requirement, or contradiction.
+IMPROVE means a substantial improvement to address or push back on with a
+reason. NIT means a small or stylistic finding to acknowledge.
+
+Only BLOCKERs gate the loop. End it when a round raises no BLOCKER, after
+disposing of every finding. Addressing IMPROVEs and NITs needs no further
+round. After changing anything for a BLOCKER, run another round so Claude
+verifies the fix. Three rounds is a cap, not a quota. At the cap, bring
+unresolved BLOCKERs and fixes still awaiting reviewer verification to the
+user; do not start a fourth round or silently finish or advance.
 
 ## Advance and finish
 
@@ -88,10 +100,12 @@ claude-review finish [--memo FINAL_MEMO]
 
 The phases are `spec -> plan -> code -> results`; advances must be adjacent.
 If the last round reports findings, disposition them in `FINAL_MEMO` before
-advancing or finishing. Every QUALITY BLOCKER must be under Addressing. A
-human-overridden PREMISE BLOCKER belongs under Pushing back and also requires
-`--override-premise "USER REASON"`; this is the audited exit at the three-round
-cap. A final `No findings.` needs no memo.
+advancing or finishing. The driver requires every QUALITY BLOCKER to be
+under Addressing. That disposition records what changed; it is not proof
+the fix worked. Follow the verification and cap rules above before closing.
+A human-overridden PREMISE BLOCKER belongs under Pushing back and also
+requires `--override-premise "USER REASON"`. A final `No findings.` needs
+no memo.
 
 Code review records branch, HEAD, and base provenance and includes bounded
 committed, staged, unstaged, and untracked work. Claude receives only Read,

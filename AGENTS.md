@@ -39,9 +39,11 @@ rather than a nudge:
   do not stack a second self-review on top of it.
 - When the user requests an independent model review, use the cross-model
   review skill: Claude invokes `codex-review`, while Codex invokes
-  `claude-review`. Normally run two rounds and classify every finding in the
-  disposition memo, including the final round before `finish`; never replace
-  the other model with a self-review.
+  `claude-review`. Only BLOCKERs gate the loop; stop when a round raises none.
+  Run another round after changing anything for a BLOCKER so the reviewer
+  verifies the fix. Cap at three rounds and bring unresolved BLOCKERs to the
+  user. Classify every finding in the disposition memo, including the final
+  round before `finish`; never replace the other model with a self-review.
 - Use subagents only when independent subtasks make the split pay, and never
   delegate review or verification.
 
@@ -52,6 +54,9 @@ rather than a nudge:
   file there.
 - `claude/settings.json` is portable and linked. Codex's live `config.toml` is
   app-owned; `codex/config.seed.toml` supplies stable defaults on a new machine.
+- Reusable Python helpers belong in `lib/`; the publisher treats every file in
+  `bin/` as an executable entry point. Linked scripts locate `lib/` from their
+  resolved source path.
 - Do not use client-local memory files — Claude auto-memory, `CLAUDE.local.md`,
   per-project memory directories — for durable knowledge; record it in this
   file or the relevant guide instead. Keeping all state explicit and versioned

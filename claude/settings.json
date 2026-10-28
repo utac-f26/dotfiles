@@ -4,7 +4,6 @@
   "hooks": {
     "SessionEnd": [
       {
-        "matcher": "clear",
         "hooks": [
           {
             "type": "command",
@@ -25,7 +24,7 @@
     ],
     "SessionStart": [
       {
-        "matcher": "clear",
+        "matcher": "startup|clear",
         "hooks": [
           {
             "type": "command",

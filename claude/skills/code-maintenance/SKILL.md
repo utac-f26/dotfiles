@@ -12,7 +12,9 @@ description: |
 # Code Maintenance
 
 Make the implementation smaller, clearer, better typed, and easier to reason
-about. Implement the improvements unless the user requested a read-only audit.
+about. Implement the improvements unless the user asked only to find or
+report them (an audit, a defect hunt, a list of problems); then report the
+findings and change nothing.
 
 Treat net-negative production code as the default direction, not a line-count
 quota. Add code when it buys a necessary test, typed boundary, or real defect
@@ -31,12 +33,15 @@ Do not infer that two paths are redundant merely because their code looks
 similar. Establish whether they provide different security, lifecycle,
 transactional, compatibility, or performance guarantees.
 
-Fix the scope before the inventory. Use the files or subsystems the user
-named. For a whole-repository request, pick the area with the most duplicated
-mechanisms or the most recent churn, name the packages or files it covers
-before editing, and hold it. Findings outside that boundary go in the report
-as follow-ups. The pass ends when the in-scope inventory is exhausted or every
-remaining item fails a calibration test.
+Scope is what the user named: those files or subsystems, or the whole
+repository. Do not widen it on your own judgment, and do not narrow a
+whole-repository request to one area. Inventory the whole scope before
+editing. Report a defect found anywhere in scope even if the pass never
+reaches it. Then work down the ranked inventory (order below), one cohesive
+change at a time, until the inventory is exhausted, every remaining item
+fails a calibration test, or a budget the user set runs out. The ranked
+inventory is the plan; what remains on it when the pass stops is the
+follow-up list.
 
 ## Inventory Before Editing
 
@@ -186,7 +191,8 @@ Lead with the outcome. Include:
 - Security or compatibility distinctions deliberately preserved.
 - Exact validation commands and results.
 - Production and total additions, deletions, and net change.
-- Unresolved risks or focused follow-up work.
+- Inventory items not reached, in rank order, as follow-ups.
+- Unresolved risks and decisions that need the user.
 
 Explain substantial net growth by major category. Continue simplifying when
 growth has no concrete justification. Follow repository policy for committing

@@ -95,6 +95,8 @@ The files have deliberately narrow roles:
   are course-owned manifests used by setup and the completion check.
 - `.editorconfig` gives editors one formatting policy for the mixed shell,
   Python, Markdown, and Makefile tree.
+- `.gitattributes` keeps text checkouts at LF even with `core.autocrlf=true`;
+  `.cmd` and `.bat` files use CRLF for `cmd.exe`.
 
 Edit each setting at its owner instead of repeating it in multiple client
 files. Runtime auth, transcripts, caches, and one-machine overrides stay
@@ -133,28 +135,36 @@ donating a full transcript is a separate, optional choice in a homework
 writeup. The Git hooks do not block a commit if collection fails, so read the
 manual command's error report before submission.
 
-## Cheap `/clear` restarts in Claude Code
+## Resuming after `/clear` or quitting Claude Code
 
 `claude/settings.json` wires `bin/claude-breadcrumbs.py` into Claude Code's
-SessionEnd and SessionStart hooks. When you run `/clear`, the ending session's
-transcript is digested mechanically — no model pass — into a markdown trail
-under `claude/breadcrumbs/`, and the fresh session starts with a one-line
-pointer to it. Continuing costs the model a single file read; a `/clear` meant
-as a genuine fresh start just ignores the pointer. This makes `/clear` the
-default way to reset context instead of waiting on compaction. The hook fails
-open: if anything goes wrong it prints nothing and your session starts
-normally. The hook wiring itself is one screen of `settings.json` — read it to
-see what a hook is.
+SessionEnd and SessionStart hooks. Every session end, including `/clear` and
+quitting, saves a mechanical digest under `claude/breadcrumbs/`. No model is
+called to summarize it. A fresh session gets a short pointer with a preview
+of the last prompt. Begin your message with `resume` (or the older
+`breadcrumbs`) to ask Claude to read the trail and continue. For a fresh task,
+give the new request and Claude ignores the pointer.
 
-The digest keeps only each turn's closing message. A clear at a task boundary
-therefore needs nothing more: the closing status report the model just printed
-is already the restart summary, kept verbatim. The habit is for the other
-endings — run `/handoff` before you clear mid-task or quit for the day. It
-writes a standardized summary — goal, decisions, verification commands, next
-action — and prints it, so the printout becomes the final closing message, the
-digest keeps it verbatim, and a same-terminal `/clear` picks it up
-automatically. The copy saved under `claude/handoffs/` covers what breadcrumbs
-cannot: quitting instead of clearing, or resuming days later.
+After `/clear`, the hook uses the ending session's pointer when it can pair
+the terminal, otherwise a short list of recent digests for that directory.
+On a new `claude` startup, it points to a recent paired session or the
+directory's newest digest only within 24 hours. A startup days later gets no
+automatic pointer; explicitly name a saved digest or handoff to resume it.
+The hook fails open, so a failure does not prevent the session from starting.
+
+The digest preserves the last answered report in full, even when a later
+prompt went unanswered. It also keeps full compaction summaries, groups
+worker messages under the user's turn, and records edited files and observed
+commits. Older reports retain their beginnings and ends when shortened. A
+trail that read an earlier digest carries forward that session's last report.
+You can still run `/handoff` to select the context a future session should
+have: goal, decisions, verification commands, and next action. It saves the
+summary under `claude/handoffs/` and prints it so the next digest includes it.
+
+Digests and handoffs contain local session content and are gitignored. Keep
+them private. Digests older than seven days are pruned when a later session
+ends; handoffs have no automatic cleanup. This does not change the raw-log
+retention required for course provenance above.
 
 ## Resetting context in the Codex app
 
@@ -201,8 +211,8 @@ HEAD` for uncommitted work. The generated snapshot records its branch, HEAD,
 and base and fails closed if there are no changes to review.
 
 The reviewer is read-only, findings use one checked format, and the originating
-agent records each disposition before a second round. Named conversations and
-review state survive context resets. Run `codex-review status` or
+agent records each disposition before continuing or finishing. Named
+conversations and review state survive context resets. Run `codex-review status` or
 `claude-review status` to recover the active review. State is stored outside
 the repository under `~/.local/state/utac-agent-review/` by default.
 If a CLI, login, or network call fails mid-round, fix the reported cause and
@@ -220,6 +230,13 @@ final memo to `finish --memo PATH` (or to `advance --memo PATH` when continuing
 the lifecycle); a `No findings.` response needs none. A QUALITY BLOCKER must
 be under Addressing. A human-overridden PREMISE BLOCKER belongs under Pushing
 back, and the driver records the override reason beside the memo.
+
+Only BLOCKERs gate the loop. Stop when a round raises none; addressing
+IMPROVEs and NITs needs no further round. After a BLOCKER fix, run another
+round so the reviewer verifies it. Three rounds is the cap. Bring unresolved
+BLOCKERs and fixes still awaiting reviewer verification to the user at that
+point. An Addressing disposition records a change; it does not prove the fix
+worked or justify silently finishing.
 
 Codex review and Claude review both work with the required UT logins. If a
 login or executable is missing, the command says which one instead of falling

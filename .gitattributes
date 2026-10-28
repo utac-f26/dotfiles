@@ -1,0 +1,7 @@
+# Keep Unix scripts and configuration readable when core.autocrlf=true.
+# Auto-detect text so binary files keep their original bytes.
+* text=auto eol=lf
+
+# cmd.exe batch files need CRLF for reliable GOTO/CALL label handling.
+*.cmd text eol=crlf
+*.bat text eol=crlf

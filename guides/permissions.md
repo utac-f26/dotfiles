@@ -43,6 +43,12 @@ HW0 accepts `defaultMode` of `default`, `acceptEdits`, or `plan`. Bare
 `"Bash"` (or `"Bash(*)"`) in `allow` auto-approves every command and is
 rejected: that is a decision to make later, with open eyes, not a default.
 
+The example's `Bash(git push --force*)` matches that command spelling. A
+reordered `git push origin main --force` or a force refspec such as
+`git push origin +main` can bypass it. Adding more command-string patterns
+does not close the subprocess escape described above. Keep narrow allow
+rules, inspect each push, and treat this deny rule as an accident guardrail.
+
 ## Codex: two knobs and a tracked seed
 
 `sandbox_mode` answers *what can it touch*; `approval_policy` answers
