@@ -185,6 +185,11 @@ trap 'rm -f "$TEMP_JSON" "$TEMP_ERR" "$TEMP_OUT" "$TEMP_META"' EXIT
 echo "claude-ask: timeout=${TIMEOUT_SECONDS}s tools=${TOOLS:-<none>}" >&2
 echo "claude-ask: prompt=$PROMPT output=$OUTPUT" >&2
 
+# A scripted run is not a session to resume: keep the breadcrumb hooks from
+# archiving it as the directory's newest digest and from handing this run
+# the pointer to the user's last interactive report (claude-breadcrumbs.py).
+export CLAUDE_BREADCRUMBS=off
+
 set +e
 # Buffer stderr so stale-session detection has a complete, portable input.
 # Process substitution depends on /dev/fd behavior that is unreliable in the

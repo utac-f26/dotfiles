@@ -151,6 +151,10 @@ On a new `claude` startup, it points to a recent paired session or the
 directory's newest digest only within 24 hours. A startup days later gets no
 automatic pointer; explicitly name a saved digest or handoff to resume it.
 The hook fails open, so a failure does not prevent the session from starting.
+Claude Code runs both hooks for scripted `claude -p` runs as well, so
+`bin/claude-ask` (which the review driver uses) exports
+`CLAUDE_BREADCRUMBS=off`: the run gets no pointer and leaves no digest. Set
+the same variable for any other scripted `claude` launch.
 
 The digest preserves the last answered report in full, even when a later
 prompt went unanswered. It also keeps full compaction summaries, groups

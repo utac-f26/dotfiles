@@ -39,6 +39,12 @@ polluted by a stale trail; continuing costs the model one Read.
 
 The hook must never break session start: sessionstart mode prints
 nothing and exits 0 on any failure (diagnostics on stderr).
+
+Scripted runs opt out: Claude Code fires both hooks for `claude -p` too, so
+a scripted reviewer (`claude-ask`) would archive a one-turn digest as the
+directory's newest and would itself be handed the pointer to the user's
+last report. Both modes return at once when the environment holds
+CLAUDE_BREADCRUMBS=off, which the hook inherits from the launching shell.
 """
 
 # pyright: strict
@@ -80,6 +86,8 @@ REAP_AGE_DAYS = 7  # delete digest files older than this
 PENDING_REAP_SECONDS = 300  # delete pending files older than this
 FRESH_SECONDS = 30  # pending file freshness window
 EDIT_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
+OFF_VARIABLE = "CLAUDE_BREADCRUMBS"  # =off: scripted run, neither read nor write
+OFF_VALUE = "off"
 
 # Mirrors the /handoff convention: output lives under ~/dotfiles/claude/
 # (not ~/.claude/) so the permissions gate on ~/.claude/ never applies,
@@ -819,10 +827,15 @@ def render_startup_pointer(digests: list[DigestCandidate]) -> str:
             f"{gist}{more}{_POINTER_RULE}")
 
 
+def breadcrumbs_off(env: Mapping[str, str]) -> bool:
+    """True for a run that opted out (a scripted `claude -p`, say)."""
+    return env.get(OFF_VARIABLE, "").strip().lower() == OFF_VALUE
+
+
 def run_sessionstart(hook: HookInput, root: Path, env: Mapping[str, str],
                      tty_name: str | None, now: float) -> str | None:
     transcript = hook.get("transcript_path", "")
-    if not transcript:
+    if not transcript or breadcrumbs_off(env):
         return None
     project_dir = Path(transcript).parent
     token = compute_token(env, tty_name)
@@ -854,7 +867,7 @@ def run_sessionend(hook: HookInput, root: Path, env: Mapping[str, str],
                    tty_name: str | None, now: float) -> None:
     """Orchestrate sessionend: delete-first, parse, digest, publish (if strong)."""
     transcript = hook.get("transcript_path", "")
-    if not transcript:
+    if not transcript or breadcrumbs_off(env):
         return
     token = compute_token(env, tty_name)
     delete_pending(root, token)          # delete-first (clears crashed predecessor)
