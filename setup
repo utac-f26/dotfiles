@@ -39,7 +39,8 @@ usage: ./setup [--update]
 
 Installs the course toolchain without root, creates the SOPS age key if needed,
 links the student-owned Claude/Codex config files, and installs the repository's
-Git hooks. Managed tool versions are pinned in tool-versions.txt; --update
+Git hooks. It allows Claude Code's npm install script in ~/.npmrc where npm
+supports that setting. Managed tool versions are pinned in tool-versions.txt; --update
 reinstalls those versions (bump the contract and asset checksums first to move
 forward).
 EOF
@@ -418,11 +419,47 @@ install_release_tools() {
     fi
 }
 
+# npm 12 blocks install scripts unless they are allowed, warning but exiting 0,
+# and Claude Code's postinstall is what installs its binary, so `claude` would
+# be left broken. ./setup's own Node carries an older npm; a student's own Node
+# may not. The setting goes in ~/.npmrc so later updates are covered too. npm 10
+# does not know the key: `get` prints "undefined" and `set` fails, and there is
+# nothing to allow.
+npm_allow_install_scripts() {
+    local package="$1"
+    local current
+    current="$(npm config get allow-scripts 2>/dev/null)" || return 0
+    [[ "$current" != undefined ]] || current=""
+    case ",$current," in
+        *",$package,"*) return 0 ;;
+    esac
+    if npm config set "allow-scripts=${current:+$current,}$package" \
+        --location=user >/dev/null 2>&1; then
+        log "allowed npm install scripts for $package in ~/.npmrc"
+    fi
+}
+
+# npm exits 0 when it blocks the script, and an npm setting in the environment
+# or a project file overrides ~/.npmrc, so check the result. This only warns:
+# one broken tool should not cost the student the rest of setup.
+warn_if_claude_broken() {
+    local package="@anthropic-ai/claude-code"
+    if [[ "$SKIP_INSTALL" == 1 ]] \
+        || tool_is_compatible claude "$CLAUDE_VERSION"; then
+        return 0
+    fi
+    log "warning: claude does not run at version $CLAUDE_VERSION or later." \
+        "To repair it, run:"
+    printf 'npm install --global --prefix ~/.local --allow-scripts=%s %s@%s\n' \
+        "$package" "$package" "$CLAUDE_VERSION" >&2
+}
+
 install_agent_tools() {
     if [[ "$SKIP_INSTALL" == 1 ]]; then
         return
     fi
     have npm || die "npm missing after Node install"
+    npm_allow_install_scripts "@anthropic-ai/claude-code"
     if should_install claude "$CLAUDE_VERSION"; then
         log "installing Claude Code CLI"
         npm install --global --prefix "${HOME}/.local" \
@@ -492,6 +529,7 @@ main() {
     ensure_age_key
     ensure_sops_yaml
     ./links
+    warn_if_claude_broken
     log "done; open a new terminal, authenticate gh and Codex, then" \
         "run ./self-check"
 }

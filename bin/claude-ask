@@ -23,8 +23,9 @@ Options:
   --append-system-prompt TEXT
                             Append to Claude's system prompt
 
-The default grants no tools. Claude's JSON result is split into the response
-file and OUTPUT.meta.json. Diagnostics go to stderr; stdout contains only the
+The default grants no tools, and no run loads MCP servers or claude.ai
+connectors. Claude's JSON result is split into the response file and
+OUTPUT.meta.json. Diagnostics go to stderr; stdout contains only the
 response-file path.
 EOF
 }
@@ -159,6 +160,12 @@ fi
 # Passing an empty value is intentional: omitting --tools lets Claude fall
 # back to its normal tool defaults instead of enforcing the no-tools policy.
 CLAUDE_ARGS+=(--tools "$TOOLS")
+# --tools governs only the built-in tools. Without strict mode a "no tools" or
+# read-only run still loads the account's claude.ai connectors (Drive and Docs
+# writes among them), which dontAsk mode runs unprompted, so untrusted text in
+# a prompt could edit the student's documents. No --mcp-config is passed, so
+# strict mode leaves the run with no MCP servers at all.
+CLAUDE_ARGS+=(--strict-mcp-config)
 if [[ -n "$TOOLS" ]]; then
     # Keep the requested tools allowed even when a non-interactive subprocess
     # resolves to Claude's default permission mode.

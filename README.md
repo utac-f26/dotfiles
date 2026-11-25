@@ -49,6 +49,13 @@ the listed version. `uv` provides Python 3.11 for the Python entry points.
 roughly 1 GB free in your home directory; `setup` checks before downloading
 anything.
 
+Newer npm versions skip a package's install script unless you allow it, and
+Claude Code needs its script to install its binary. Where npm supports the
+setting, `./setup` adds `@anthropic-ai/claude-code` to `allow-scripts` in your
+`~/.npmrc` and keeps the entries already there; it allows no other package. If
+`claude` still does not run, `./setup` prints a warning and the command to
+repair it.
+
 It does not symlink the whole `~/.claude` or `~/.codex` directory. It also does
 not symlink Codex's live `config.toml`, which Codex rewrites with machine and
 project state. Those directories and files contain auth state, transcripts,
